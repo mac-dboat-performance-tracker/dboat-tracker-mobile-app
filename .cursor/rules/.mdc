@@ -1,0 +1,103 @@
+---
+alwaysApply: true
+globs: **/*.dart
+description: Senior-level Flutter/Dart engineering standards for this repository
+---
+
+When modifying Dart/Flutter code, operate with a senior-engineer mindset:
+
+## General Principles
+- Make **precise, minimal changes**. Do not introduce unnecessary refactors or architectural shifts.
+- Respect and extend the **existing architecture**:
+  - BLE → `BLEProvider`
+  - State → `PaddlerProvider`
+  - Persistence → `CSVLogger` / `SessionStorage`
+- Treat existing APIs/models as **stable contracts**. Avoid breaking changes unless explicitly required.
+  - If changes are necessary, update all usages across `lib/`
+  - Maintain strict null-safety correctness
+
+---
+
+## Code Quality Expectations
+- Write **production-grade code**, not quick patches
+- Prefer:
+  - Clear naming over cleverness
+  - Deterministic, predictable logic
+  - Small, composable functions
+- Avoid:
+  - Hidden side effects
+  - Implicit assumptions
+  - Tight coupling between layers
+
+---
+
+## Architecture & Separation of Concerns
+- UI layer:
+  - Responsible ONLY for rendering + subscribing to state
+  - No business logic, no data processing
+- Business logic:
+  - Lives in services/modules (pure where possible)
+- State:
+  - Flows through providers, not ad-hoc variables
+
+---
+
+## Signal Processing / Real-Time Logic
+- All signal-processing logic (e.g., stroke detection):
+  - Must be **pure and deterministic**
+  - Isolated in a dedicated service/module
+- Maintain:
+  - Consistent units (`accel`, `currentForce` = acceleration magnitude)
+  - Explicit assumptions (sampling rate, thresholds, etc.)
+- Prefer:
+  - Simple, efficient algorithms over complex abstractions
+- Add brief comments only where logic is non-obvious (e.g., peak detection, state machines)
+
+---
+
+## Performance & Real-Time Constraints
+- Never block the main isolate
+- For non-trivial computation:
+  - Offload work OR
+  - Keep processing windows small and efficient
+- Ensure:
+  - Streams, timers, and subscriptions are **properly disposed**
+  - No memory leaks or dangling listeners
+
+---
+
+## Persistence & CSV Handling
+- Maintain strict compatibility with:
+  - `SessionStorage.loadSessionForceData()`
+- Do NOT break existing CSV formats unless required
+  - If changes are introduced:
+    - Maintain backward compatibility when possible
+    - Update parsing logic safely
+- Be explicit about schema changes
+
+---
+
+## Reliability & Safety
+- Code must compile cleanly
+- Resolve all:
+  - Type errors
+  - Import issues
+  - Lint warnings introduced by your changes
+- Avoid introducing runtime risks (null issues, race conditions, unhandled states)
+
+---
+
+## Style & Consistency
+- Follow existing formatting — do NOT reformat unrelated code
+- Keep code consistent with current patterns in the repo
+- Comments should be:
+  - Minimal
+  - Practical
+  - Focused on “why”, not “what”
+
+---
+
+## Final Standard
+Every change should meet this bar:
+
+> Another senior engineer should be able to read your code and immediately trust it in production.

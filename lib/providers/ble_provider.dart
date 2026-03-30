@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
+import '../services/csv_logger.dart';
 
 class BLEProvider extends ChangeNotifier {
   static final BLEProvider _instance = BLEProvider._internal();
@@ -18,7 +19,9 @@ class BLEProvider extends ChangeNotifier {
   // Stream controllers for each device
   final Map<String, StreamController<SensorData>> _dataControllers = {};
 
-  /// Per-device receive buffer for text CSV lines (device sends "ax,ay,az,qw,qx,qy,qz\n").
+  /// Per-device receive buffer for text CSV lines.
+  /// Device sends rows as UTF-8 CSV:
+  /// time_us,time_dif_us,data_type,value_1,value_2,value_3,value_4
   final Map<String, List<int>> _receiveBuffers = {};
 
   // Simple connection queue
@@ -223,8 +226,7 @@ class BLEProvider extends ChangeNotifier {
       if (buffer == null) return;
       buffer.addAll(value);
 
-      // Device sends char line[128] via setValue(line, strlen(line)) — no newline in BLE payload.
-      // Reassemble: either split on \n, or when we have 6 commas assume one full line "ax,ay,az,qw,qx,qy,qz".
+      // Reassemble stream into CSV lines. If no newline, detect complete line by comma count (6 commas => 7 fields).
       while (buffer.isNotEmpty) {
         final newlineIdx = buffer.indexOf(10);
         final lineEnd = newlineIdx >= 0 ? newlineIdx : buffer.length;
@@ -237,31 +239,65 @@ class BLEProvider extends ChangeNotifier {
           buffer.removeRange(0, lineEnd);
         }
         if (lineBytes.isEmpty) continue;
-        final sensorData = _decodeCsvLine(lineBytes);
-        if (sensorData != null) {
-          _dataControllers[deviceId]?.add(sensorData);
-        }
+        _handleCsvLine(deviceId, lineBytes);
       }
     });
 
     _subscriptions[deviceId] = subscription;
   }
 
-  /// Parse one CSV line: "ax,ay,az,qw,qx,qy,qz" -> SensorData(acc). Returns null on parse error.
-  SensorData? _decodeCsvLine(List<int> lineBytes) {
+  void _handleCsvLine(String deviceId, List<int> lineBytes) {
     String line;
     try {
       line = utf8.decode(lineBytes).replaceAll('\r', '').trim();
     } catch (_) {
-      return null;
+      return;
     }
-    if (line.isEmpty) return null;
+    if (line.isEmpty) return;
     final parts = line.split(',');
-    if (parts.length < 3) return null;
-    final accX = double.tryParse(parts[0].trim()) ?? 0.0;
-    final accY = double.tryParse(parts[1].trim()) ?? 0.0;
-    final accZ = double.tryParse(parts[2].trim()) ?? 0.0;
-    return SensorData(accX: accX, accY: accY, accZ: accZ);
+    if (parts.length < 7) return;
+
+    final int? timeUs = int.tryParse(parts[0].trim());
+    final int? timeDifUs = int.tryParse(parts[1].trim());
+    final double? dataType = double.tryParse(parts[2].trim());
+    final double v1 = double.tryParse(parts[3].trim()) ?? 0.0;
+    final double v2 = double.tryParse(parts[4].trim()) ?? 0.0;
+    final double v3 = double.tryParse(parts[5].trim()) ?? 0.0;
+    final double v4 = double.tryParse(parts[6].trim()) ?? 0.0;
+
+    if (timeUs == null || timeDifUs == null || dataType == null) return;
+
+    // Forward both row types to UI stream for real-time consumption.
+    final evt = dataType == 0.0
+        ? SensorData(
+            timeUs: timeUs,
+            timeDifUs: timeDifUs,
+            dataType: dataType,
+            accX: v1,
+            accY: v2,
+            accZ: v3,
+          )
+        : SensorData(
+            timeUs: timeUs,
+            timeDifUs: timeDifUs,
+            dataType: dataType,
+            qw: v1,
+            qi: v2,
+            qj: v3,
+            qk: v4,
+          );
+    _dataControllers[deviceId]?.add(evt);
+
+    // Append raw row to CSV logger if recording.
+    CSVLogger().appendInterleavedRow(
+      timeUs: timeUs,
+      timeDifUs: timeDifUs,
+      dataType: dataType,
+      value1: v1,
+      value2: v2,
+      value3: v3,
+      value4: v4,
+    );
   }
 
   // Disconnect from a device
@@ -333,9 +369,29 @@ class BLEProvider extends ChangeNotifier {
 }
 
 class SensorData {
+  final int timeUs;
+  final int timeDifUs;
+  final double dataType; // 0.0 = accel (v1..v3), 1.0 = quaternion (v1..v4)
+  // Acceleration (valid when dataType == 0.0)
   final double accX;
   final double accY;
   final double accZ;
+  // Quaternion (valid when dataType == 1.0) in order q,i,j,k
+  final double qw;
+  final double qi;
+  final double qj;
+  final double qk;
 
-  SensorData({required this.accX, required this.accY, required this.accZ});
+  SensorData({
+    required this.timeUs,
+    required this.timeDifUs,
+    required this.dataType,
+    this.accX = 0.0,
+    this.accY = 0.0,
+    this.accZ = 0.0,
+    this.qw = 0.0,
+    this.qi = 0.0,
+    this.qj = 0.0,
+    this.qk = 0.0,
+  });
 }

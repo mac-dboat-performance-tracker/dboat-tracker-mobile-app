@@ -1,4 +1,9 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'dart:io';
+import 'package:path_provider/path_provider.dart';
+import 'package:flutter_cube/flutter_cube.dart';
+import 'stroke_test_screen.dart';
 import '../models/session.dart';
 import '../services/session_storage.dart';
 import 'session_screen.dart';
@@ -14,6 +19,11 @@ class HomeScreen extends StatefulWidget {
 class _HomeScreenState extends State<HomeScreen> {
   List<Session> _sessions = [];
   bool _isLoading = true;
+  bool _isPyvistaRunning = false;
+  String? _pyvistaPngPath;
+  String? _pyvistaError;
+
+  static const MethodChannel _pyChannel = MethodChannel('py');
 
   @override
   void initState() {
@@ -115,6 +125,36 @@ class _HomeScreenState extends State<HomeScreen> {
                 label: const Text('Calibrate Sensors'),
               ),
             ),
+            // Stroke Detector CSV Test Button (temporary)
+            Padding(
+              padding: const EdgeInsets.symmetric(
+                horizontal: 24.0,
+                vertical: 8.0,
+              ),
+              child: OutlinedButton.icon(
+                onPressed: () {
+                  Navigator.push(
+                    context,
+                    MaterialPageRoute(
+                      builder: (context) => const StrokeTestScreen(),
+                    ),
+                  );
+                },
+                style: OutlinedButton.styleFrom(
+                  foregroundColor: Colors.white,
+                  side: const BorderSide(color: Colors.white70),
+                  padding: const EdgeInsets.symmetric(
+                    vertical: 16,
+                    horizontal: 24,
+                  ),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                ),
+                icon: const Icon(Icons.stacked_line_chart),
+                label: const Text('Test Stroke Detector (CSV)'),
+              ),
+            ),
             // Start New Recording Button
             Padding(
               padding: const EdgeInsets.symmetric(
@@ -185,6 +225,7 @@ class _HomeScreenState extends State<HomeScreen> {
                 ),
               ),
             ),
+
             // Past Recordings Section
             Expanded(
               child: Container(

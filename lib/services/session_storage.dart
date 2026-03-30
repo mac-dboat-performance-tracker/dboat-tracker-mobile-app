@@ -166,10 +166,10 @@ class SessionStorage {
   }
 
   // Load force data from CSV file for a session
-  static Future<Map<String, List<ForceDataPoint>>> loadSessionForceData(
+  static Future<Map<String, List<AccelDataPoint>>> loadSessionForceData(
     String sessionId,
   ) async {
-    final Map<String, List<ForceDataPoint>> paddlerData = {};
+    final Map<String, List<AccelDataPoint>> paddlerData = {};
 
     try {
       final directory = await getApplicationDocumentsDirectory();
@@ -196,28 +196,32 @@ class SessionStorage {
 
       final header = lines[0].toLowerCase();
       final useAccFormat = header.contains('acc_x');
+      // Older CSVs were written with a mismatched header (e.g. `force_n,x,y`)
+      // while still outputting accX/accY/accZ values in columns 3..5.
+      // Treat `force_n`-headed files with 6 columns as accelerometer format too.
+      final useLegacyAccFormat = !useAccFormat && header.contains('force_n');
 
       for (var line in lines.sublist(1)) {
         final parts = line.split(',');
         try {
-          if (useAccFormat && parts.length >= 6) {
+          if ((useAccFormat || useLegacyAccFormat) && parts.length >= 6) {
             final timestamp = double.parse(parts[0]);
             final paddlerId = parts[1];
             final accX = double.parse(parts[3]);
             final accY = double.parse(parts[4]);
             final accZ = double.parse(parts[5]);
             final magnitude = sqrt(accX * accX + accY * accY + accZ * accZ);
-            paddlerData.putIfAbsent(paddlerId, () => []).add(
-              ForceDataPoint(time: timestamp, force: magnitude),
-            );
+            paddlerData
+                .putIfAbsent(paddlerId, () => [])
+                .add(AccelDataPoint(time: timestamp, accel: magnitude));
           } else if (!useAccFormat && parts.length >= 4) {
             // Old format: timestamp_s, paddler_id, paddler_name, force_n [, x, y]
             final timestamp = double.parse(parts[0]);
             final paddlerId = parts[1];
             final force = double.parse(parts[3]);
-            paddlerData.putIfAbsent(paddlerId, () => []).add(
-              ForceDataPoint(time: timestamp, force: force),
-            );
+            paddlerData
+                .putIfAbsent(paddlerId, () => [])
+                .add(AccelDataPoint(time: timestamp, accel: force));
           }
         } catch (e) {
           continue;

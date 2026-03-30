@@ -18,7 +18,7 @@ class ForceGraphWidget extends StatefulWidget {
 }
 
 class ForceGraphWidgetState extends State<ForceGraphWidget> {
-  final List<List<ForceDataPoint>> _streamingData = [];
+  final List<List<AccelDataPoint>> _streamingData = [];
   Timer? _timer;
   double _currentTime = 0.0;
   final int _maxDataPoints =
@@ -95,9 +95,9 @@ class ForceGraphWidgetState extends State<ForceGraphWidget> {
               _lastMagnitudes.add(magnitude);
             }
 
-            final newPoint = ForceDataPoint(
+            final newPoint = AccelDataPoint(
               time: _currentTime,
-              force: magnitude,
+              accel: magnitude,
             );
 
             // Ensure we have enough lists
@@ -250,7 +250,7 @@ class ForceGraphWidgetState extends State<ForceGraphWidget> {
                   final dataPoints =
                       _streamingData.isNotEmpty && index < _streamingData.length
                       ? _streamingData[index]
-                      : <ForceDataPoint>[];
+                      : <AccelDataPoint>[];
 
                   // Filter data points to only show those within the visible range
                   final visiblePoints = dataPoints
@@ -261,7 +261,7 @@ class ForceGraphWidgetState extends State<ForceGraphWidget> {
 
                   return LineChartBarData(
                     spots: visiblePoints.map((point) {
-                      return FlSpot(point.time, point.force);
+                      return FlSpot(point.time, point.accel);
                     }).toList(),
                     isCurved: true,
                     curveSmoothness: 0.35, // Smoother curves, less glitchy

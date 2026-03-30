@@ -4,9 +4,10 @@ class Paddler {
   final String id; // MAC address
   final String name;
   final Color color;
-  final List<ForceDataPoint> forceData;
+  final List<AccelDataPoint> forceData;
   final List<Insight> insights;
   final PaddlePosition position3D;
+
   /// Acceleration magnitude (m/s²), used for graph; derived from accX, accY, accZ.
   double currentForce;
   List<int> position; // [X, Y] — legacy, kept for compatibility
@@ -32,7 +33,7 @@ class Paddler {
     String? id,
     String? name,
     Color? color,
-    List<ForceDataPoint>? forceData,
+    List<AccelDataPoint>? forceData,
     List<Insight>? insights,
     PaddlePosition? position3D,
     double? currentForce,
@@ -57,11 +58,11 @@ class Paddler {
   }
 }
 
-class ForceDataPoint {
+class AccelDataPoint {
   final double time; // in seconds
-  final double force; // in Newtons
+  final double accel; // acceleration magnitude (m/s²)
 
-  ForceDataPoint({required this.time, required this.force});
+  AccelDataPoint({required this.time, required this.accel});
 }
 
 class Insight {
@@ -69,28 +70,15 @@ class Insight {
   final String description;
   final InsightType type;
 
-  Insight({
-    required this.title,
-    required this.description,
-    required this.type,
-  });
+  Insight({required this.title, required this.description, required this.type});
 }
 
-enum InsightType {
-  positive,
-  warning,
-  info,
-}
+enum InsightType { positive, warning, info }
 
 class PaddlePosition {
   final double x; // angle in degrees
   final double y; // angle in degrees
   final double z; // angle in degrees
 
-  PaddlePosition({
-    required this.x,
-    required this.y,
-    required this.z,
-  });
+  PaddlePosition({required this.x, required this.y, required this.z});
 }
-

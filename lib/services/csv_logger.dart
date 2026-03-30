@@ -9,17 +9,11 @@ class CSVLogger {
   factory CSVLogger() => _instance;
   CSVLogger._internal();
 
-  /// Sample rate in Hz. 10 Hz is a good balance for force/IMU (not too big, enough resolution).
-  static const int kSampleRateHz = 10;
-  static const int _intervalMs = 1000 ~/ kSampleRateHz;
-
   File? _csvFile;
   bool _isLogging = false;
-  Timer? _loggingTimer;
   bool _isWriting = false;
   final List<String> _writeQueue = [];
   DateTime? _sessionStartTime;
-  List<Paddler> Function()? _getPaddlers;
 
   Future<void> startLogging(
     List<Paddler> paddlers, {
@@ -39,38 +33,31 @@ class CSVLogger {
     final timestamp = DateTime.now().toIso8601String().replaceAll(':', '-');
     _csvFile = File('${directory.path}/session_$timestamp.csv');
     _sessionStartTime = DateTime.now();
-    _getPaddlers = getPaddlers;
 
-    const header = 'timestamp_s,paddler_id,paddler_name,force_n,x,y\n';
+    // New interleaved IMU schema header (matches live BLE rows):
+    // time_us,time_dif_us,data_type,value_1,value_2,value_3,value_4
+    const header =
+        'time_us,time_dif_us,data_type,value_1,value_2,value_3,value_4\n';
     await _csvFile!.writeAsString(header);
 
     _isLogging = true;
-    final startTime = DateTime.now();
-
-    _loggingTimer = Timer.periodic(const Duration(milliseconds: _intervalMs), (
-      timer,
-    ) {
-      if (!_isLogging) {
-        timer.cancel();
-        return;
-      }
-      final elapsedSec =
-          DateTime.now().difference(startTime).inMilliseconds / 1000.0;
-      final currentPaddlers = _getPaddlers != null ? _getPaddlers!() : paddlers;
-      _logDataPoint(currentPaddlers, elapsedSec);
-    });
   }
 
-  void _logDataPoint(List<Paddler> paddlers, double timestampSec) {
-    if (_csvFile == null) return;
-
-    final buffer = StringBuffer();
-    for (var paddler in paddlers) {
-      buffer.writeln(
-        '$timestampSec,${paddler.id},${paddler.name},${paddler.accX},${paddler.accY},${paddler.accZ}',
-      );
-    }
-    _writeQueue.add(buffer.toString());
+  /// Append a single interleaved IMU row (already in target schema).
+  /// Only writes when logging has started.
+  void appendInterleavedRow({
+    required int timeUs,
+    required int timeDifUs,
+    required double dataType,
+    required double value1,
+    required double value2,
+    required double value3,
+    required double value4,
+  }) {
+    if (!_isLogging || _csvFile == null) return;
+    final line =
+        '$timeUs,$timeDifUs,${dataType.toStringAsFixed(1)},$value1,$value2,$value3,$value4\n';
+    _writeQueue.add(line);
     _processWriteQueue();
   }
 
@@ -102,8 +89,6 @@ class CSVLogger {
     if (!_isLogging && _csvFile == null) return null;
 
     _isLogging = false;
-    _loggingTimer?.cancel();
-    _loggingTimer = null;
 
     await _drainWriteQueue();
 
@@ -124,7 +109,6 @@ class CSVLogger {
 
       final newFile = await _csvFile!.rename(newPath);
       _csvFile = newFile;
-      _getPaddlers = null; // Clear reference
       return newFile.path;
     }
 
@@ -138,7 +122,6 @@ class CSVLogger {
         print('Error deleting unsaved CSV file: $e');
       }
       _csvFile = null;
-      _getPaddlers = null;
     }
 
     return _csvFile?.path;

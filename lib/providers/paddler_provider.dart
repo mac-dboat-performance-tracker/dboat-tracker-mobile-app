@@ -43,12 +43,15 @@ class PaddlerProvider extends ChangeNotifier {
         final dataStream = _bleProvider.getDataStream(paddler.id);
         if (dataStream != null) {
           final subscription = dataStream.listen((sensorData) {
-            _updatePaddlerData(
-              paddler.id,
-              sensorData.accX,
-              sensorData.accY,
-              sensorData.accZ,
-            );
+            // Only update paddler acceleration on acceleration rows (data_type == 0.0)
+            if (sensorData.dataType == 0.0) {
+              _updatePaddlerData(
+                paddler.id,
+                sensorData.accX,
+                sensorData.accY,
+                sensorData.accZ,
+              );
+            }
           });
           _subscriptions[paddler.id] = subscription;
         }
@@ -67,7 +70,9 @@ class PaddlerProvider extends ChangeNotifier {
     }
 
     if (_isRecording && _paddlers.isNotEmpty) {
-      connectedIds = connectedIds.where((id) => _paddlers.any((p) => p.id == id)).toList();
+      connectedIds = connectedIds
+          .where((id) => _paddlers.any((p) => p.id == id))
+          .toList();
     }
 
     for (var deviceId in _subscriptions.keys.toList()) {

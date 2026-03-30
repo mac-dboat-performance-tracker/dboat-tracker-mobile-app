@@ -5,7 +5,7 @@ import '../models/paddler.dart';
 
 class HistoricalForceGraphWidget extends StatefulWidget {
   final List<Paddler> paddlers;
-  final Map<String, List<ForceDataPoint>> historicalData;
+  final Map<String, List<AccelDataPoint>> historicalData;
   final Function(List<Paddler>)? onReplayUpdate;
 
   const HistoricalForceGraphWidget({
@@ -22,7 +22,7 @@ class HistoricalForceGraphWidget extends StatefulWidget {
 
 class _HistoricalForceGraphWidgetState
     extends State<HistoricalForceGraphWidget> {
-  final List<List<ForceDataPoint>> _streamingData = [];
+  final List<List<AccelDataPoint>> _streamingData = [];
   Timer? _timer;
   double _currentTime = 0.0;
   final double _updateInterval = 0.1; // Update every 0.1 seconds
@@ -30,7 +30,7 @@ class _HistoricalForceGraphWidgetState
   final int _maxDataPoints = 200; // Keep last 200 data points
 
   // Replay state
-  final List<List<ForceDataPoint>> _fullHistoricalData = [];
+  final List<List<AccelDataPoint>> _fullHistoricalData = [];
   double _replayTime = 0.0;
   double _maxReplayTime = 0.0;
   bool _isReplaying = false;
@@ -165,7 +165,7 @@ class _HistoricalForceGraphWidgetState
               final fullData = _fullHistoricalData[i];
 
               // Find the most recent data point at or before current replay time
-              ForceDataPoint? currentPoint;
+              AccelDataPoint? currentPoint;
               for (var point in fullData.reversed) {
                 if (point.time <= _replayTime) {
                   currentPoint = point;
@@ -175,7 +175,7 @@ class _HistoricalForceGraphWidgetState
 
               // Update paddler with current force value
               final updatedPaddler = paddler.copyWith(
-                currentForce: currentPoint?.force ?? 0.0,
+                currentForce: currentPoint?.accel ?? 0.0,
                 position: currentPoint != null ? [0, 0] : paddler.position,
               );
               updatedPaddlers.add(updatedPaddler);
@@ -325,7 +325,7 @@ class _HistoricalForceGraphWidgetState
                   final dataPoints =
                       _streamingData.isNotEmpty && index < _streamingData.length
                       ? _streamingData[index]
-                      : <ForceDataPoint>[];
+                      : <AccelDataPoint>[];
 
                   // Filter data points to only show those within the visible range
                   final visiblePoints = dataPoints
@@ -336,7 +336,7 @@ class _HistoricalForceGraphWidgetState
 
                   return LineChartBarData(
                     spots: visiblePoints.map((point) {
-                      return FlSpot(point.time, point.force);
+                      return FlSpot(point.time, point.accel);
                     }).toList(),
                     isCurved: true,
                     curveSmoothness: 0.35,

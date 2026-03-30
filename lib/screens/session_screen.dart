@@ -11,6 +11,10 @@ import '../providers/paddler_provider.dart';
 import '../providers/ble_provider.dart';
 import '../services/csv_logger.dart';
 import '../services/session_storage.dart';
+import '../services/stroke_detector.dart';
+import '../services/paddle_orientation.dart';
+import 'package:flutter_cube/flutter_cube.dart';
+import 'dart:math' show sqrt;
 
 class SessionScreen extends StatefulWidget {
   final Session session;
@@ -31,10 +35,28 @@ class _SessionScreenState extends State<SessionScreen> {
   final Set<String> _selectedDeviceIds = {};
   DateTime? _sessionStartTime;
   Timer? _durationTimer;
-  Map<String, List<ForceDataPoint>>? _historicalData;
+  Map<String, List<AccelDataPoint>>? _historicalData;
   bool _isLoadingHistoricalData = false;
   List<Paddler> _replayPaddlers = []; // Paddlers updated during replay
   bool get _isPastSession => widget.session.id != 'session_new';
+
+  // Live stroke metrics
+  final StrokeDetector _strokeDetector = StrokeDetector();
+  double _liveSpm = 0.0;
+  int _liveTotalStrokes = 0;
+  int? _t0Us;
+
+  // Live quaternion buffer for 3D
+  final List<double> _qt = [];
+  final List<double> _qw = [];
+  final List<double> _qx = [];
+  final List<double> _qy = [];
+  final List<double> _qz = [];
+  static const int _maxQuatSamples = 512;
+  PaddleOrientation? _livePaddle;
+  Object? _paddleObj;
+  Timer? _renderTimer;
+  StreamSubscription<SensorData>? _liveBleSub;
 
   @override
   void initState() {
@@ -48,6 +70,7 @@ class _SessionScreenState extends State<SessionScreen> {
       WidgetsBinding.instance.addPostFrameCallback((_) {
         final provider = Provider.of<PaddlerProvider>(context, listen: false);
         provider.syncPaddlersFromConnectedDevices();
+        _startLiveSubscriptions();
       });
     }
   }
@@ -90,7 +113,10 @@ class _SessionScreenState extends State<SessionScreen> {
     if (!mounted || _isScanning) return;
     setState(() => _isScanning = true);
     try {
-      final paddlerProvider = Provider.of<PaddlerProvider>(context, listen: false);
+      final paddlerProvider = Provider.of<PaddlerProvider>(
+        context,
+        listen: false,
+      );
       await paddlerProvider.scanForDevices();
     } catch (e) {
       _showError('Scan failed: $e');
@@ -104,8 +130,14 @@ class _SessionScreenState extends State<SessionScreen> {
       return;
     }
     try {
-      final paddlerProvider = Provider.of<PaddlerProvider>(context, listen: false);
-      await paddlerProvider.connectToSelectedDevices(_selectedDeviceIds.toList());
+      final paddlerProvider = Provider.of<PaddlerProvider>(
+        context,
+        listen: false,
+      );
+      await paddlerProvider.connectToSelectedDevices(
+        _selectedDeviceIds.toList(),
+      );
+      _startLiveSubscriptions();
     } catch (e) {
       _showError('Connect failed: $e');
     }
@@ -143,6 +175,9 @@ class _SessionScreenState extends State<SessionScreen> {
         timer.cancel();
       }
     });
+
+    // Ensure live feed is active
+    _startLiveSubscriptions();
   }
 
   void _cancelConnecting() {
@@ -246,6 +281,8 @@ class _SessionScreenState extends State<SessionScreen> {
     _durationTimer?.cancel();
     // Don't save CSV on dispose - only save when user explicitly stops recording
     // _csvLogger.stopLogging(); // Removed to prevent duplicate saves
+    _liveBleSub?.cancel();
+    _renderTimer?.cancel();
     super.dispose();
   }
 
@@ -291,18 +328,12 @@ class _SessionScreenState extends State<SessionScreen> {
                 children: [
                   const Text(
                     'Select sensors for this session',
-                    style: TextStyle(
-                      fontSize: 18,
-                      fontWeight: FontWeight.bold,
-                    ),
+                    style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
                   ),
                   const SizedBox(height: 8),
                   Text(
                     'Only DB_IMU sensors are shown. Scan, check the devices you want, tap Connect selected. You can Disconnect any device before starting. Proceed to start recording (no new devices during recording).',
-                    style: TextStyle(
-                      fontSize: 13,
-                      color: Colors.grey.shade700,
-                    ),
+                    style: TextStyle(fontSize: 13, color: Colors.grey.shade700),
                   ),
                   const SizedBox(height: 16),
                   SizedBox(
@@ -316,7 +347,9 @@ class _SessionScreenState extends State<SessionScreen> {
                               child: CircularProgressIndicator(strokeWidth: 2),
                             )
                           : const Icon(Icons.bluetooth_searching),
-                      label: Text(_isScanning ? 'Scanning...' : 'Scan for devices'),
+                      label: Text(
+                        _isScanning ? 'Scanning...' : 'Scan for devices',
+                      ),
                     ),
                   ),
                 ],
@@ -328,7 +361,11 @@ class _SessionScreenState extends State<SessionScreen> {
                       child: Column(
                         mainAxisAlignment: MainAxisAlignment.center,
                         children: [
-                          Icon(Icons.bluetooth_disabled, size: 48, color: Colors.grey.shade400),
+                          Icon(
+                            Icons.bluetooth_disabled,
+                            size: 48,
+                            color: Colors.grey.shade400,
+                          ),
                           const SizedBox(height: 16),
                           Text(
                             _isScanning
@@ -346,11 +383,12 @@ class _SessionScreenState extends State<SessionScreen> {
                       itemBuilder: (context, index) {
                         final deviceId = scannedEntries[index].key;
                         final result = scannedEntries[index].value;
-                        final name = result.advertisementData.localName.trim().isNotEmpty
+                        final name =
+                            result.advertisementData.localName.trim().isNotEmpty
                             ? result.advertisementData.localName.trim()
                             : (result.device.platformName.isNotEmpty
-                                ? result.device.platformName
-                                : 'Unknown');
+                                  ? result.device.platformName
+                                  : 'Unknown');
                         final isConnected = bleProvider.isConnected(deviceId);
                         final selected = _selectedDeviceIds.contains(deviceId);
                         return Card(
@@ -372,12 +410,12 @@ class _SessionScreenState extends State<SessionScreen> {
                             ),
                             title: Text(
                               name,
-                              style: const TextStyle(fontWeight: FontWeight.w500),
+                              style: const TextStyle(
+                                fontWeight: FontWeight.w500,
+                              ),
                             ),
                             subtitle: Text(
-                              isConnected
-                                  ? 'Connected'
-                                  : deviceId,
+                              isConnected ? 'Connected' : deviceId,
                               style: TextStyle(
                                 fontSize: 12,
                                 color: isConnected
@@ -391,8 +429,9 @@ class _SessionScreenState extends State<SessionScreen> {
                                       await bleProvider.disconnect(deviceId);
                                       if (!mounted) return;
                                       final pp = Provider.of<PaddlerProvider>(
-                                          context,
-                                          listen: false);
+                                        context,
+                                        listen: false,
+                                      );
                                       pp.syncPaddlersFromConnectedDevices();
                                       setState(() {
                                         _selectedDeviceIds.remove(deviceId);
@@ -409,9 +448,14 @@ class _SessionScreenState extends State<SessionScreen> {
             ),
             if (scannedEntries.isNotEmpty)
               Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 16,
+                  vertical: 8,
+                ),
                 child: ElevatedButton(
-                  onPressed: _selectedDeviceIds.isEmpty ? null : _connectSelected,
+                  onPressed: _selectedDeviceIds.isEmpty
+                      ? null
+                      : _connectSelected,
                   style: ElevatedButton.styleFrom(
                     backgroundColor: Colors.green.shade700,
                     padding: const EdgeInsets.symmetric(vertical: 14),
@@ -443,13 +487,18 @@ class _SessionScreenState extends State<SessionScreen> {
                         padding: const EdgeInsets.symmetric(vertical: 16),
                         side: BorderSide(color: Colors.grey.shade400),
                       ),
-                      child: const Text('Cancel', style: TextStyle(fontSize: 16)),
+                      child: const Text(
+                        'Cancel',
+                        style: TextStyle(fontSize: 16),
+                      ),
                     ),
                   ),
                   const SizedBox(width: 16),
                   Expanded(
                     child: ElevatedButton(
-                      onPressed: paddlerProvider.paddlers.isEmpty ? null : _proceedToRecording,
+                      onPressed: paddlerProvider.paddlers.isEmpty
+                          ? null
+                          : _proceedToRecording,
                       style: ElevatedButton.styleFrom(
                         backgroundColor: Colors.blue.shade700,
                         foregroundColor: Colors.white,
@@ -458,7 +507,10 @@ class _SessionScreenState extends State<SessionScreen> {
                       ),
                       child: Text(
                         'Proceed (${paddlerProvider.paddlers.length})',
-                        style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+                        style: const TextStyle(
+                          fontSize: 16,
+                          fontWeight: FontWeight.bold,
+                        ),
                       ),
                     ),
                   ),
@@ -547,6 +599,50 @@ class _SessionScreenState extends State<SessionScreen> {
               child: PaddlerDashboard(
                 paddlers: paddlers,
                 isRecording: isRecording,
+              ),
+            ),
+            const SizedBox(height: 16),
+            // Live Stroke Metrics + 3D View
+            _buildSectionCard(
+              title: 'Stroke & 3D',
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      Expanded(
+                        child: _buildMetricCard(
+                          label: 'SPM',
+                          value: _liveSpm.toStringAsFixed(1),
+                          icon: Icons.fitness_center,
+                        ),
+                      ),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: _buildMetricCard(
+                          label: 'Strokes',
+                          value: '$_liveTotalStrokes',
+                          icon: Icons.countertops,
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 12),
+                  SizedBox(
+                    height: 220,
+                    child: Cube(
+                      onSceneCreated: (scene) {
+                        scene.camera.zoom = 8;
+                        final obj = Object(
+                          fileName: 'assets/models/paddle.obj',
+                        );
+                        _paddleObj = obj;
+                        scene.world.add(obj);
+                        _ensureRenderTimer();
+                      },
+                    ),
+                  ),
+                ],
               ),
             ),
             const SizedBox(height: 16),
@@ -766,5 +862,81 @@ class _SessionScreenState extends State<SessionScreen> {
         ),
       );
     }
+  }
+
+  // ------------ Live subscriptions & 3D rendering ------------
+  void _startLiveSubscriptions() {
+    _liveBleSub?.cancel();
+    final ble = Provider.of<BLEProvider>(context, listen: false);
+    // For now, subscribe to the first connected device stream
+    final paddlers = Provider.of<PaddlerProvider>(
+      context,
+      listen: false,
+    ).paddlers;
+    if (paddlers.isEmpty) return;
+    final deviceId = paddlers.first.id;
+    final stream = ble.getDataStream(deviceId);
+    if (stream == null) return;
+
+    _liveBleSub = stream.listen((evt) {
+      // Establish t0 from BLE timestamps
+      _t0Us ??= evt.timeUs;
+      final tSec = ((_t0Us != null) ? (evt.timeUs - _t0Us!) : 0) / 1e6;
+
+      if (evt.dataType == 0.0) {
+        // Acceleration row -> stroke detector
+        final mag = sqrt(
+          evt.accX * evt.accX + evt.accY * evt.accY + evt.accZ * evt.accZ,
+        );
+        final upd = _strokeDetector.addSample(tSec: tSec, accelMag: mag);
+        if (mounted) {
+          setState(() {
+            _liveSpm = upd.rateSpm;
+            _liveTotalStrokes = upd.totalStrokes;
+          });
+        }
+      } else if (evt.dataType == 1.0) {
+        // Quaternion row (q, i, j, k) -> (qw,qx,qy,qz)
+        _qt.add(tSec);
+        _qw.add(evt.qw);
+        _qx.add(evt.qi);
+        _qy.add(evt.qj);
+        _qz.add(evt.qk);
+        // Trim buffers
+        if (_qt.length > _maxQuatSamples) {
+          final drop = _qt.length - _maxQuatSamples;
+          _qt.removeRange(0, drop);
+          _qw.removeRange(0, drop);
+          _qx.removeRange(0, drop);
+          _qy.removeRange(0, drop);
+          _qz.removeRange(0, drop);
+        }
+        // Rebuild orientation with current buffers
+        if (_qt.length >= 2) {
+          _livePaddle = PaddleOrientation(
+            tSec: List<double>.from(_qt),
+            qw: List<double>.from(_qw),
+            qx: List<double>.from(_qx),
+            qy: List<double>.from(_qy),
+            qz: List<double>.from(_qz),
+            fixedXDeg: 0.0,
+            fixedYDeg: 45.0,
+            fixedZDeg: 90.0,
+            yawOnly: true,
+          );
+        }
+      }
+    });
+  }
+
+  void _ensureRenderTimer() {
+    _renderTimer ??= Timer.periodic(const Duration(milliseconds: 33), (_) {
+      if (_paddleObj == null || _livePaddle == null || _qt.isEmpty) return;
+      // Drive using latest timestamp in buffer
+      final t = _qt.isNotEmpty ? _qt.last : 0.0;
+      final e = _livePaddle!.eulerAt(t);
+      _paddleObj!.rotation.setValues(e.x, e.y, e.z);
+      _paddleObj!.updateTransform();
+    });
   }
 }

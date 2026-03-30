@@ -7,13 +7,13 @@ class DummyData {
   static final Random _random = Random();
 
   // Generate dummy force data points
-  static List<ForceDataPoint> generateForceData(int count) {
+  static List<AccelDataPoint> generateForceData(int count) {
     return List.generate(count, (index) {
       final time = index * 2.0; // 2 seconds between points
       final baseForce = 100.0 + _random.nextDouble() * 50.0;
       final variation = sin(index * 0.5) * 20.0;
       final force = baseForce + variation;
-      return ForceDataPoint(time: time, force: force.clamp(50.0, 200.0));
+      return AccelDataPoint(time: time, accel: force.clamp(50.0, 200.0));
     });
   }
 
@@ -31,17 +31,20 @@ class DummyData {
     return [
       Insight(
         title: 'Excellent Synchronization',
-        description: '$paddlerName shows 92% sync rate, above optimal range of 85-95%. Great coordination!',
+        description:
+            '$paddlerName shows 92% sync rate, above optimal range of 85-95%. Great coordination!',
         type: InsightType.positive,
       ),
       Insight(
         title: 'Power Consistency',
-        description: 'Average force output is stable at 145N with only 5% variation. Maintain this rhythm.',
+        description:
+            'Average force output is stable at 145N with only 5% variation. Maintain this rhythm.',
         type: InsightType.positive,
       ),
       Insight(
         title: 'Recovery Optimization',
-        description: 'ML suggests reducing recovery by 0.15s could increase stroke rate by 3-5 spm.',
+        description:
+            'ML suggests reducing recovery by 0.15s could increase stroke rate by 3-5 spm.',
         type: InsightType.warning,
       ),
     ];
@@ -49,18 +52,8 @@ class DummyData {
 
   // Create dummy paddlers
   static List<Paddler> createDummyPaddlers() {
-    final colors = [
-      Colors.blue,
-      Colors.green,
-      Colors.orange,
-      Colors.red,
-    ];
-    final names = [
-      'Alex Chen',
-      'Maria Garcia',
-      'James Wilson',
-      'Sarah Kim',
-    ];
+    final colors = [Colors.blue, Colors.green, Colors.orange, Colors.red];
+    final names = ['Alex Chen', 'Maria Garcia', 'James Wilson', 'Sarah Kim'];
 
     return List.generate(4, (index) {
       return Paddler(
@@ -108,4 +101,3 @@ class DummyData {
     ];
   }
 }
-
