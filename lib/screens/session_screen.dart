@@ -14,7 +14,9 @@ import '../services/session_storage.dart';
 import '../services/stroke_detector.dart';
 import '../services/paddle_orientation.dart';
 import 'package:flutter_cube/flutter_cube.dart';
-import 'dart:math' show sqrt;
+import 'dart:math' show sqrt, acos, pi;
+import 'dart:io';
+import 'package:path_provider/path_provider.dart';
 
 class SessionScreen extends StatefulWidget {
   final Session session;
@@ -41,10 +43,19 @@ class _SessionScreenState extends State<SessionScreen> {
   bool get _isPastSession => widget.session.id != 'session_new';
 
   // Live stroke metrics
-  final StrokeDetector _strokeDetector = StrokeDetector();
+  final StrokeDetector _strokeDetector = StrokeDetector(
+    windowSec: 5.0,
+    minPeakDistanceSec: 0.62,
+    smoothingAlpha: 0.1,
+    baselineAlpha: 0.05,
+    thresholdMin: 0.57,
+    thresholdK: 1.0,
+    warmupSec: 0.5,
+  );
   double _liveSpm = 0.0;
   int _liveTotalStrokes = 0;
   int? _t0Us;
+  bool _strokeCountingEnabled = false;
 
   // Live quaternion buffer for 3D
   final List<double> _qt = [];
@@ -57,6 +68,28 @@ class _SessionScreenState extends State<SessionScreen> {
   Object? _paddleObj;
   Timer? _renderTimer;
   StreamSubscription<SensorData>? _liveBleSub;
+
+  // Replay 3D buffers
+  final List<double> _rt = [];
+  final List<double> _rqw = [];
+  final List<double> _rqx = [];
+  final List<double> _rqy = [];
+  final List<double> _rqz = [];
+  PaddleOrientation? _replayPaddle;
+  Object? _replayObj;
+  Timer? _replayTimer;
+  double _replayT = 0.0;
+  double _replayTMax = 0.0;
+
+  // Replay gyro-based stroke signal (mirrors test screen's _strokeT/_strokeSig)
+  List<double> _replayStrokeT = [];
+  List<double> _replayStrokeSig = [];
+
+  // Live gyro-based stroke signal (from quaternions)
+  double? _prevQw, _prevQx, _prevQy, _prevQz;
+  double? _prevQt; // seconds
+  final List<double> _gyroMag = [];
+  final int _gyroBufMax = 200;
 
   @override
   void initState() {
@@ -91,6 +124,9 @@ class _SessionScreenState extends State<SessionScreen> {
           _replayPaddlers = List.from(widget.session.paddlers);
         });
       }
+
+      // Initialize replay 3D if CSV is interleaved
+      await _initReplayQuaternionsIfAvailable();
     } catch (e) {
       print('Error loading historical data: $e');
       if (mounted) {
@@ -157,7 +193,18 @@ class _SessionScreenState extends State<SessionScreen> {
     setState(() {
       _isConnecting = false;
       _sessionStartTime = DateTime.now();
+      // Start stroke counting only once the user explicitly starts recording.
+      _strokeCountingEnabled = true;
+      _liveSpm = 0.0;
+      _liveTotalStrokes = 0;
     });
+
+    // Reset stroke detection timeline to start at 0 for each recording.
+    _strokeDetector.reset();
+    _t0Us = null;
+    _prevQt = null;
+    _prevQw = _prevQx = _prevQy = _prevQz = null;
+    _gyroMag.clear();
 
     paddlerProvider.startRecording();
     // Pass a function to get fresh paddler data each time
@@ -215,6 +262,9 @@ class _SessionScreenState extends State<SessionScreen> {
         setState(() {
           _sessionStartTime = null;
           _isConnecting = false;
+          _strokeCountingEnabled = false;
+          _liveSpm = 0.0;
+          _liveTotalStrokes = 0;
         });
       }
 
@@ -539,6 +589,14 @@ class _SessionScreenState extends State<SessionScreen> {
           // Key Metrics Section
           _buildMetricsSectionForPastSession(duration, paddlers.length),
           const SizedBox(height: 16),
+          // Replay Stroke Metrics (first paddler)
+          if (_historicalData != null && _historicalData!.isNotEmpty)
+            _buildSectionCard(
+              title: 'Stroke (Replay)',
+              child: _buildReplayStrokeMetrics(),
+            ),
+          if (_historicalData != null && _historicalData!.isNotEmpty)
+            const SizedBox(height: 16),
           // Paddler Dashboard
           _buildSectionCard(
             title: 'Paddler Dashboard',
@@ -568,6 +626,25 @@ class _SessionScreenState extends State<SessionScreen> {
                 : const Center(child: Text('No historical data available')),
           ),
           const SizedBox(height: 16),
+          // 3D Replay (if available)
+          if (_replayPaddle != null)
+            _buildSectionCard(
+              title: '3D Replay',
+              child: SizedBox(
+                height: 220,
+                child: Cube(
+                  interactive: false,
+                  onSceneCreated: (scene) {
+                    scene.camera.zoom = 8;
+                    final obj = Object(fileName: 'assets/models/paddle.obj');
+                    _replayObj = obj;
+                    scene.world.add(obj);
+                    _ensureReplayTimer();
+                  },
+                ),
+              ),
+            ),
+          if (_replayPaddle != null) const SizedBox(height: 16),
           // Insights Section
           _buildSectionCard(
             title: 'ML Insights',
@@ -631,6 +708,7 @@ class _SessionScreenState extends State<SessionScreen> {
                   SizedBox(
                     height: 220,
                     child: Cube(
+                      interactive: false,
                       onSceneCreated: (scene) {
                         scene.camera.zoom = 8;
                         final obj = Object(
@@ -884,16 +962,47 @@ class _SessionScreenState extends State<SessionScreen> {
       final tSec = ((_t0Us != null) ? (evt.timeUs - _t0Us!) : 0) / 1e6;
 
       if (evt.dataType == 0.0) {
-        // Acceleration row -> stroke detector
-        final mag = sqrt(
-          evt.accX * evt.accX + evt.accY * evt.accY + evt.accZ * evt.accZ,
-        );
-        final upd = _strokeDetector.addSample(tSec: tSec, accelMag: mag);
-        if (mounted) {
-          setState(() {
-            _liveSpm = upd.rateSpm;
-            _liveTotalStrokes = upd.totalStrokes;
-          });
+        // Acceleration row -> stroke detector (ONLY when recording is active)
+        if (_strokeCountingEnabled) {
+          // Prefer gyro-based stroke signal if available, else fallback to |a|
+          double? sig;
+          if (_gyroMag.isNotEmpty) {
+            // Smooth with small trailing average (~11)
+            final w = 11;
+            final cnt = _gyroMag.length < w ? _gyroMag.length : w;
+            double s = 0.0;
+            for (int i = 0; i < cnt; i++) {
+              s += _gyroMag[_gyroMag.length - 1 - i];
+            }
+            final gSmooth = s / (cnt > 0 ? cnt : 1);
+            final copy = List<double>.from(_gyroMag)..sort();
+            double pick(double p) {
+              if (copy.isEmpty) return 0.0;
+              final idx = ((copy.length - 1) * p).round().clamp(
+                0,
+                copy.length - 1,
+              );
+              return copy[idx];
+            }
+
+            final low = pick(0.05);
+            final high = pick(0.95);
+            final denom = (high > low) ? (high - low) : 1e-6;
+            sig = ((gSmooth - low) / denom).clamp(0.0, 1.0);
+          }
+          final mag = sqrt(
+            evt.accX * evt.accX + evt.accY * evt.accY + evt.accZ * evt.accZ,
+          );
+          final upd = _strokeDetector.addSample(
+            tSec: tSec,
+            accelMag: sig ?? mag,
+          );
+          if (mounted) {
+            setState(() {
+              _liveSpm = upd.rateSpm;
+              _liveTotalStrokes = upd.totalStrokes;
+            });
+          }
         }
       } else if (evt.dataType == 1.0) {
         // Quaternion row (q, i, j, k) -> (qw,qx,qy,qz)
@@ -902,6 +1011,80 @@ class _SessionScreenState extends State<SessionScreen> {
         _qx.add(evt.qi);
         _qy.add(evt.qj);
         _qz.add(evt.qk);
+
+        // Update live gyro-based stroke signal from successive quaternions
+        if (_prevQt != null &&
+            _prevQw != null &&
+            _prevQx != null &&
+            _prevQy != null &&
+            _prevQz != null) {
+          final dt = (tSec - _prevQt!).clamp(1e-3, 0.05);
+          double w1 = _prevQw!, x1 = _prevQx!, y1 = _prevQy!, z1 = _prevQz!;
+          double w2 = evt.qw, x2 = evt.qi, y2 = evt.qj, z2 = evt.qk;
+          final n1 = sqrt(w1 * w1 + x1 * x1 + y1 * y1 + z1 * z1);
+          final n2 = sqrt(w2 * w2 + x2 * x2 + y2 * y2 + z2 * z2);
+          if (n1 > 1e-9) {
+            w1 /= n1;
+            x1 /= n1;
+            y1 /= n1;
+            z1 /= n1;
+          } else {
+            w1 = 1;
+            x1 = y1 = z1 = 0;
+          }
+          if (n2 > 1e-9) {
+            w2 /= n2;
+            x2 /= n2;
+            y2 /= n2;
+            z2 /= n2;
+          } else {
+            w2 = 1;
+            x2 = y2 = z2 = 0;
+          }
+          final dot = w1 * w2 + x1 * x2 + y1 * y2 + z1 * z2;
+          if (dot < 0) {
+            w2 = -w2;
+            x2 = -x2;
+            y2 = -y2;
+            z2 = -z2;
+          }
+          final wc = w1, xc = -x1, yc = -y1, zc = -z1;
+          final dw = wc * w2 - xc * x2 - yc * y2 - zc * z2;
+          double dx = wc * x2 + xc * w2 + yc * z2 - zc * y2;
+          double dy = wc * y2 - xc * z2 + yc * w2 + zc * x2;
+          double dz = wc * z2 + xc * y2 - yc * x2 + zc * w2;
+          final dnorm = sqrt(dw * dw + dx * dx + dy * dy + dz * dz);
+          final ndw = dnorm > 1e-12 ? (dw / dnorm) : dw;
+          dx = dnorm > 1e-12 ? dx / dnorm : dx;
+          dy = dnorm > 1e-12 ? dy / dnorm : dy;
+          dz = dnorm > 1e-12 ? dz / dnorm : dz;
+          final wC = ndw.clamp(-1.0, 1.0);
+          var angle = 2.0 * acos(wC);
+          if (angle > pi) {
+            angle = 2.0 * pi - angle;
+            dx = -dx;
+            dy = -dy;
+            dz = -dz;
+          }
+          final s = sqrt((1.0 - wC * wC).clamp(1e-12, 1.0));
+          if (s >= 1e-6 && dt > 1e-6 && angle > 1e-9) {
+            final ax = dx / s, ay = dy / s, az = dz / s;
+            final wx = ax * (angle / dt),
+                wy = ay * (angle / dt),
+                wz = az * (angle / dt);
+            final gmag = sqrt(wx * wx + wy * wy + wz * wz);
+            _gyroMag.add(gmag);
+            if (_gyroMag.length > _gyroBufMax) _gyroMag.removeAt(0);
+          } else if (_gyroMag.isNotEmpty) {
+            _gyroMag.add(_gyroMag.last);
+            if (_gyroMag.length > _gyroBufMax) _gyroMag.removeAt(0);
+          }
+        }
+        _prevQt = tSec;
+        _prevQw = evt.qw;
+        _prevQx = evt.qi;
+        _prevQy = evt.qj;
+        _prevQz = evt.qk;
         // Trim buffers
         if (_qt.length > _maxQuatSamples) {
           final drop = _qt.length - _maxQuatSamples;
@@ -937,6 +1120,305 @@ class _SessionScreenState extends State<SessionScreen> {
       final e = _livePaddle!.eulerAt(t);
       _paddleObj!.rotation.setValues(e.x, e.y, e.z);
       _paddleObj!.updateTransform();
+    });
+  }
+
+  Widget _buildReplayStrokeMetrics() {
+    final firstKey = _historicalData!.keys.first;
+    final series = _historicalData![firstKey]!;
+    if (series.isEmpty) {
+      return const Text('No data');
+    }
+
+    final det = StrokeDetector(
+      windowSec: 5.0,
+      minPeakDistanceSec: 0.62,
+      smoothingAlpha: 0.1,
+      baselineAlpha: 0.05,
+      thresholdMin: 0.57,
+      thresholdK: 1.0,
+      warmupSec: 0.5,
+    );
+
+    int total = 0;
+    double lastSpm = 0.0;
+
+    final hasGyroSignal =
+        _replayStrokeT.isNotEmpty && _replayStrokeSig.isNotEmpty;
+
+    // Compute metrics only up to the current replay time so replay starts at zero.
+    final tLimit = _replayT;
+    for (final p in series) {
+      if (p.time > tLimit) break;
+      double sig;
+      if (hasGyroSignal) {
+        // Nearest-neighbour lookup on gyro stroke signal — identical to test screen replay
+        var j = _lowerBound(_replayStrokeT, p.time);
+        if (j > 0 && j < _replayStrokeT.length) {
+          final prev = (p.time - _replayStrokeT[j - 1]).abs();
+          final next = (_replayStrokeT[j] - p.time).abs();
+          if (prev <= next) j = j - 1;
+        } else if (j >= _replayStrokeT.length) {
+          j = _replayStrokeT.length - 1;
+        }
+        sig = _replayStrokeSig[j];
+      } else {
+        sig = p.accel; // fallback for old-format sessions
+      }
+      final upd = det.addSample(tSec: p.time, accelMag: sig);
+      total = upd.totalStrokes;
+      lastSpm = upd.rateSpm;
+    }
+    return Row(
+      children: [
+        Expanded(
+          child: _buildMetricCard(
+            label: 'SPM (last window)',
+            value: lastSpm.toStringAsFixed(1),
+            icon: Icons.fitness_center,
+          ),
+        ),
+        const SizedBox(width: 12),
+        Expanded(
+          child: _buildMetricCard(
+            label: 'Total Strokes',
+            value: '$total',
+            icon: Icons.countertops,
+          ),
+        ),
+      ],
+    );
+  }
+
+  // ------------ Replay 3D parsing & animation ------------
+  Future<void> _initReplayQuaternionsIfAvailable() async {
+    try {
+      // Read raw CSV for this session and detect interleaved header
+      final dir = await getApplicationDocumentsDirectory();
+      final path = '${dir.path}/${widget.session.id}';
+      final file = File(path);
+      if (!await file.exists()) return;
+      final content = await file.readAsString();
+      final lines = content
+          .split('\n')
+          .where((l) => l.trim().isNotEmpty)
+          .toList();
+      if (lines.isEmpty) return;
+      final header = lines.first.toLowerCase();
+      if (!header.startsWith('time_us,time_dif_us,data_type')) return;
+
+      _rt.clear();
+      _rqw.clear();
+      _rqx.clear();
+      _rqy.clear();
+      _rqz.clear();
+
+      // Find global t0 across ALL rows (accel + quat) so timelines align.
+      double? t0Us;
+      for (var i = 1; i < lines.length; i++) {
+        final parts = lines[i].split(',');
+        if (parts.length < 3) continue;
+        final tUs = double.tryParse(parts[0]);
+        if (tUs == null) continue;
+        if (t0Us == null || tUs < t0Us) t0Us = tUs;
+      }
+      if (t0Us == null) return;
+
+      for (var i = 1; i < lines.length; i++) {
+        final parts = lines[i].split(',');
+        if (parts.length < 7) continue;
+        final dataType = double.tryParse(parts[2]);
+        if (dataType == null || dataType != 1.0) continue;
+        final timeUs = double.tryParse(parts[0]);
+        if (timeUs == null) continue;
+        final tSec = (timeUs - t0Us) / 1e6;
+        final qw = double.tryParse(parts[3]) ?? 0.0;
+        final qi = double.tryParse(parts[4]) ?? 0.0;
+        final qj = double.tryParse(parts[5]) ?? 0.0;
+        final qk = double.tryParse(parts[6]) ?? 0.0;
+        _rt.add(tSec);
+        _rqw.add(qw);
+        _rqx.add(qi);
+        _rqy.add(qj);
+        _rqz.add(qk);
+      }
+      if (_rt.length >= 2) {
+        _replayT = 0.0;
+        _replayTMax = _rt.last;
+        _replayPaddle = PaddleOrientation(
+          tSec: _rt,
+          qw: _rqw,
+          qx: _rqx,
+          qy: _rqy,
+          qz: _rqz,
+          fixedXDeg: 0.0,
+          fixedYDeg: 45.0,
+          fixedZDeg: 90.0,
+          yawOnly: true,
+        );
+        // Build gyro-based stroke signal exactly as the test screen does.
+        _buildReplayStrokeSignal();
+        if (mounted) setState(() {});
+      }
+    } catch (_) {
+      // Ignore CSV parse errors here
+    }
+  }
+
+  /// Mirrors StrokeTestScreen._buildStrokeSignal() exactly:
+  /// normalize quats → enforce continuity → compute Δq gyro mag → MA(11) → 5–95% percentile norm.
+  void _buildReplayStrokeSignal() {
+    _replayStrokeT = [];
+    _replayStrokeSig = [];
+    final n = _rt.length;
+    if (n < 2) return;
+
+    // Working copies
+    final qw = List<double>.from(_rqw);
+    final qx = List<double>.from(_rqx);
+    final qy = List<double>.from(_rqy);
+    final qz = List<double>.from(_rqz);
+
+    // Step 1: normalize + enforce quaternion continuity
+    for (var i = 0; i < n; i++) {
+      final norm = sqrt(
+        qw[i] * qw[i] + qx[i] * qx[i] + qy[i] * qy[i] + qz[i] * qz[i],
+      );
+      if (norm > 1e-9) {
+        qw[i] /= norm;
+        qx[i] /= norm;
+        qy[i] /= norm;
+        qz[i] /= norm;
+      } else {
+        qw[i] = 1;
+        qx[i] = qy[i] = qz[i] = 0;
+      }
+      if (i > 0) {
+        final dot =
+            qw[i - 1] * qw[i] +
+            qx[i - 1] * qx[i] +
+            qy[i - 1] * qy[i] +
+            qz[i - 1] * qz[i];
+        if (dot < 0) {
+          qw[i] = -qw[i];
+          qx[i] = -qx[i];
+          qy[i] = -qy[i];
+          qz[i] = -qz[i];
+        }
+      }
+    }
+
+    // Step 2: compute angular velocity magnitude from Δq
+    final dt = List<double>.filled(n, 0.0);
+    for (var i = 1; i < n; i++) {
+      dt[i] = (_rt[i] - _rt[i - 1]).clamp(1e-3, 0.05);
+    }
+    final gyroMag = List<double>.filled(n, 0.0);
+    for (var i = 1; i < n; i++) {
+      double w1 = qw[i - 1], x1 = qx[i - 1], y1 = qy[i - 1], z1 = qz[i - 1];
+      double w2 = qw[i], x2 = qx[i], y2 = qy[i], z2 = qz[i];
+      // Δq = conj(q1) * q2
+      final wc = w1, xc = -x1, yc = -y1, zc = -z1;
+      final dw = wc * w2 - xc * x2 - yc * y2 - zc * z2;
+      double dx = wc * x2 + xc * w2 + yc * z2 - zc * y2;
+      double dy = wc * y2 - xc * z2 + yc * w2 + zc * x2;
+      double dz = wc * z2 + xc * y2 - yc * x2 + zc * w2;
+      final dnorm = sqrt(dw * dw + dx * dx + dy * dy + dz * dz);
+      final ndw = dnorm > 1e-12 ? (dw / dnorm) : dw;
+      dx = dnorm > 1e-12 ? dx / dnorm : dx;
+      dy = dnorm > 1e-12 ? dy / dnorm : dy;
+      dz = dnorm > 1e-12 ? dz / dnorm : dz;
+      final wC = ndw.clamp(-1.0, 1.0);
+      var angle = 2.0 * acos(wC);
+      if (angle > pi) {
+        angle = 2.0 * pi - angle;
+        dx = -dx;
+        dy = -dy;
+        dz = -dz;
+      }
+      final s = sqrt((1.0 - wC * wC).clamp(1e-12, 1.0));
+      if (s >= 1e-6 && dt[i] > 1e-6 && angle > 1e-9) {
+        final ax = dx / s, ay = dy / s, az = dz / s;
+        final wx = ax * (angle / dt[i]),
+            wy = ay * (angle / dt[i]),
+            wz = az * (angle / dt[i]);
+        gyroMag[i] = sqrt(wx * wx + wy * wy + wz * wz);
+      } else {
+        gyroMag[i] = gyroMag[i - 1];
+      }
+    }
+    if (n > 1) gyroMag[0] = gyroMag[1];
+
+    // Step 3: moving average window 11 (identical to test screen)
+    List<double> ma(List<double> v, int w) {
+      if (w <= 1) return List<double>.from(v);
+      final out = List<double>.filled(v.length, 0.0);
+      final half = w ~/ 2;
+      for (var i = 0; i < v.length; i++) {
+        double s = 0.0;
+        int cnt = 0;
+        for (var j = -half; j <= half; j++) {
+          final idx = i + j;
+          if (idx >= 0 && idx < v.length) {
+            s += v[idx];
+            cnt++;
+          }
+        }
+        out[i] = cnt > 0 ? s / cnt : v[i];
+      }
+      return out;
+    }
+
+    final gSmooth = ma(gyroMag, 11);
+
+    // Step 4: global 5–95% percentile normalization (identical to test screen)
+    final sorted = List<double>.from(gSmooth)..sort();
+    double pickP(double p) {
+      if (sorted.isEmpty) return 0.0;
+      final idx = ((sorted.length - 1) * p).round().clamp(0, sorted.length - 1);
+      return sorted[idx];
+    }
+
+    final low = pickP(0.05);
+    final high = pickP(0.95);
+    final denom = (high > low) ? (high - low) : 1e-6;
+
+    _replayStrokeT = List.from(_rt);
+    _replayStrokeSig = List<double>.generate(n, (i) {
+      final v = (gSmooth[i] - low) / denom;
+      return v < 0 ? 0.0 : (v > 1.0 ? 1.0 : v);
+    });
+  }
+
+  /// Binary lower-bound helper used for nearest-neighbour lookup on sorted time lists.
+  int _lowerBound(List<double> a, double x) {
+    int lo = 0, hi = a.length;
+    while (lo < hi) {
+      final mid = (lo + hi) >> 1;
+      if (a[mid] < x) {
+        lo = mid + 1;
+      } else {
+        hi = mid;
+      }
+    }
+    return lo;
+  }
+
+  void _ensureReplayTimer() {
+    if (_replayPaddle == null || _replayObj == null) return;
+    _replayTimer ??= Timer.periodic(const Duration(milliseconds: 33), (_) {
+      if (_replayPaddle == null || _replayObj == null) return;
+      // Advance time; simple looping playback
+      _replayT += 1.0 / 30.0;
+      if (_replayT > _replayTMax) _replayT = 0.0;
+      final e = _replayPaddle!.eulerAt(_replayT);
+      _replayObj!.rotation.setValues(e.x, e.y, e.z);
+      _replayObj!.updateTransform();
+      if (mounted) {
+        setState(() {
+          // Update replay stroke metrics UI to match the replay timeline.
+        });
+      }
     });
   }
 }
