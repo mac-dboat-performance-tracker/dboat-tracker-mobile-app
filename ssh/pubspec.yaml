@@ -1,0 +1,11 @@
+name: ssh_tools
+description: Small Dart scripts for SSH/Slurm helpers.
+version: 0.0.1
+publish_to: "none"
+
+environment:
+  sdk: ">=3.0.0 <4.0.0"
+
+dependencies:
+  dartssh2: ^2.9.0
+
