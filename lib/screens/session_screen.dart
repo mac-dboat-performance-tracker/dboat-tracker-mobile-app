@@ -11,7 +11,7 @@ import '../services/csv_logger.dart';
 import '../services/session_storage.dart';
 import '../services/stroke_detector.dart';
 import '../services/pull_length_detector.dart';
-import 'dart:math' show sqrt, acos, pi, sin;
+import 'dart:math' show sqrt, acos, pi, pow;
 import 'dart:io';
 import 'package:path_provider/path_provider.dart';
 
@@ -949,32 +949,36 @@ class _SessionScreenState extends State<SessionScreen> {
     required double timeSec,
     required double previousForce,
   }) {
-    final dynamicAccel = (accelMagnitude - 9.2).clamp(0.0, 7.5);
-    final accelNorm = dynamicAccel / 7.5;
-    final cadenceNorm = (strokeRateSpm / 55.0).clamp(0.0, 1.0);
-    final activeBias = totalStrokes > 0 ? 1.0 : 0.0;
+    // Signature kept the same so the rest of the file does not need to change.
+    const double baseline = 0.0;
+    const double deadband = 0.25;
+    const double maxDynamicAccel = 20.0;
+    const double peakForceN = 180.0;
+    const double gamma = 1.6;
+    const double attackAlpha = 0.40;
+    const double releaseAlpha = 0.18;
 
-    var targetForce =
-        78.0 +
-        (accelNorm * 44.0) +
-        (cadenceNorm * 18.0) +
-        (activeBias * 4.0);
+    final double dynamicAccel = (accelMagnitude - baseline).clamp(
+      0.0,
+      double.infinity,
+    );
+    final double effectiveAccel = (dynamicAccel - deadband).clamp(
+      0.0,
+      double.infinity,
+    );
 
-    final surge = ((accelNorm * 0.7) + (cadenceNorm * 0.3)).clamp(0.0, 1.0);
-    if (surge > 0.55) {
-      targetForce += (surge - 0.55) * 90.0;
+    if (effectiveAccel <= 1e-9) {
+      final double decayed = previousForce * (1.0 - releaseAlpha);
+      return decayed < 0.5 ? 0.0 : decayed;
     }
 
-    final jitter =
-        (sin(timeSec * 2.4 + totalStrokes * 0.41 + accelMagnitude * 0.33) *
-                4.5) +
-        (sin(timeSec * 5.7 + strokeRateSpm * 0.08) * 2.0);
-    targetForce = (targetForce + jitter).clamp(65.0, 195.0);
+    final double norm = (effectiveAccel / maxDynamicAccel).clamp(0.0, 1.0);
+    final double targetForce = peakForceN * pow(norm, gamma).toDouble();
 
-    if (previousForce <= 0.0) {
-      return targetForce;
-    }
-    return previousForce + ((targetForce - previousForce) * 0.22);
+    final double alpha = targetForce > previousForce
+        ? attackAlpha
+        : releaseAlpha;
+    return previousForce + alpha * (targetForce - previousForce);
   }
 
   String _formatAccelForce(double accelMagnitude, double pseudoForce) {
