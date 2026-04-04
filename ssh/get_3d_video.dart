@@ -15,10 +15,11 @@ void main() async {
   // try submitting the job to Slurm using sbatch, which runs our python script for generate the 3D video
   try {
     // !!! set local_path to the path of the CSV file that we want to transferred to the server and want to process
-    
+
     // define the path of the CSV file that we want to send to the server
-    final local_path = "imu-datasets/cleaned_water_datasets/rand_10.csv"; // copy the relative path, and use '/' instead of '\'
-    // extract the file name
+    final local_path =
+        "datasets/rand_10.csv"; // copy the relative path, and use '/' instead of '\'
+    // extract the file nameS
     final String file_name = local_path.split('/').last;
     // set the destination path on the server after sending
     final String imu_path = '/home/let36/capstone/data/$file_name';
@@ -31,7 +32,9 @@ void main() async {
     // Open remote file (creates if missing, overwrites if existing)
     final remote_file = await sftp.open(
       imu_path,
-      mode: SftpFileOpenMode.create | SftpFileOpenMode.write | SftpFileOpenMode.truncate,
+      mode: SftpFileOpenMode.create |
+          SftpFileOpenMode.write |
+          SftpFileOpenMode.truncate,
     );
     // Stream the local file data to the remote server
     await remote_file.write(local_file.openRead().cast<Uint8List>());
@@ -40,7 +43,8 @@ void main() async {
     print('File transferred successfully to $imu_path');
 
     // change directory to where our .sh script is, activate conda, then run sbatch while passing the imu_path as an argument to the .sh script, which will then pass it to the python script
-    final command = 'cd /home/let36/capstone/scripts && conda activate sam3 && sbatch run_script.sh $imu_path';
+    final command =
+        'cd /home/let36/capstone/scripts && conda activate sam3 && sbatch run_script.sh $imu_path';
     // submit the job to Slurm
     final result = await client.run(command);
     final output = utf8.decode(result).trim();
@@ -55,23 +59,23 @@ void main() async {
     print('Monitoring Job ID: $job_id via squeue...');
 
     while (in_queue) {
-        // wait for 2 seconds before checking again
-        await Future.delayed(Duration(seconds: 2));
+      // wait for 2 seconds before checking again
+      await Future.delayed(Duration(seconds: 2));
 
-        // Run squeue for your specific Job ID
-        // -h removes the header, -j filters by ID, -t specifies states (optional)
-        final check = await client.run('squeue -h -j $job_id');
-        final status = utf8.decode(check).trim();
+      // Run squeue for your specific Job ID
+      // -h removes the header, -j filters by ID, -t specifies states (optional)
+      final check = await client.run('squeue -h -j $job_id');
+      final status = utf8.decode(check).trim();
 
-        if (status.isEmpty) {
-            // If squeue returns nothing, the job is no longer Pending or Running
-            print('Job $job_id is no longer in the queue. (Finished)');
-            in_queue = false;
-        } else {
-            // status will contain a line like: "123456  debug  run_script  let36  R  0:01  1  node01"
-            // We can parse the 'R' (Running) or 'PD' (Pending) if we want to be fancy
-            print('Job status: $status');
-        }
+      if (status.isEmpty) {
+        // If squeue returns nothing, the job is no longer Pending or Running
+        print('Job $job_id is no longer in the queue. (Finished)');
+        in_queue = false;
+      } else {
+        // status will contain a line like: "123456  debug  run_script  let36  R  0:01  1  node01"
+        // We can parse the 'R' (Running) or 'PD' (Pending) if we want to be fancy
+        print('Job status: $status');
+      }
     }
 
     // once the job is done, we want to transfer back the 3D videos
@@ -97,10 +101,10 @@ void main() async {
         print('Downloading $video_name...');
         final remote_file = await sftp.open(remote_video_path);
         final local_file = File(local_video_path).openWrite();
-        
+
         // Read from remote and pipe to local file
         await local_file.addStream(remote_file.read());
-        
+
         await local_file.close();
         print('Videos saved to $local_video_path');
       } catch (e) {
@@ -108,10 +112,9 @@ void main() async {
       }
     }
     print('Completed.');
-
   } catch (e) {
     print('An error occurred: $e');
   } finally {
-    client.close(); 
+    client.close();
   }
 }

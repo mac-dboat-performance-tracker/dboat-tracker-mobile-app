@@ -6,6 +6,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart' show rootBundle;
 import 'package:fl_chart/fl_chart.dart';
 import '../services/stroke_detector.dart';
+import '../services/pull_length_detector.dart';
 import 'package:flutter_cube/flutter_cube.dart';
 import '../services/paddle_orientation.dart';
 
@@ -24,13 +25,27 @@ class _StrokeTestScreenState extends State<StrokeTestScreen> {
   static const double _kFixedZDeg = 90.0;
   final StrokeDetector _detector = StrokeDetector(
     windowSec: 5.0,
-    minPeakDistanceSec: 0.62,
+    minPeakDistanceSec: 0.80,
     smoothingAlpha: 0.1,
     baselineAlpha: 0.05,
-    thresholdMin: 0.57,
-    thresholdK: 1.0, // fixed threshold like Python
+    thresholdMin: 0.55,
+    thresholdK: 1.0,
     warmupSec: 0.5,
   );
+
+  // Pull-length detector — real-time block-by-block analysis.
+  final PullLengthDetector _pld = const PullLengthDetector();
+  PullLengthResult _pldResult = PullLengthResult.empty;
+
+  // Preprocessed signal rows built once at load time.
+  List<SignalRow> _signalRows = [];
+  List<double> _signalRowTimes = []; // parallel time vector for binary search
+
+  // How many preprocessed rows have already been included in the last batch.
+  int _pldProcessedRowCount = 0;
+
+  // Re-run process() every time this many new signal rows are consumed.
+  static const int _pldBlockSize = 20;
 
   bool _loading = true;
   String? _error;
@@ -87,8 +102,10 @@ class _StrokeTestScreenState extends State<StrokeTestScreen> {
       _qy = parsed.$8;
       _qz = parsed.$9;
       if (_t.isEmpty) throw Exception('No accel rows parsed (data_type == 0).');
-      // Build gyro-based stroke signal from rotation rows (if present)
+      // Build gyro-based stroke signal from rotation rows (if present).
       _buildStrokeSignal();
+      // Run MATLAB-equivalent pull-length analysis on the full signal.
+      _runPullLengthAnalysis();
       setState(() => _loading = false);
     } catch (e) {
       setState(() {
@@ -281,7 +298,7 @@ class _StrokeTestScreenState extends State<StrokeTestScreen> {
     }
     if (n > 1) gyroMag[0] = gyroMag[1];
 
-    // Moving average window 11
+    // Centered moving-average helper
     List<double> ma(List<double> v, int w) {
       if (w <= 1) return List<double>.from(v);
       final out = List<double>.filled(v.length, 0.0);
@@ -301,24 +318,105 @@ class _StrokeTestScreenState extends State<StrokeTestScreen> {
       return out;
     }
 
-    final gSmooth = ma(gyroMag, 11);
+    // Step 1: MA(15) — water-stroke smooth window
+    final gSmooth = ma(gyroMag, 15);
 
-    // Percentile normalize 5..95
-    final sorted = List<double>.from(gSmooth)..sort();
-    double pickP(double p) {
-      if (sorted.isEmpty) return 0.0;
-      final idx = ((sorted.length - 1) * p).round().clamp(0, sorted.length - 1);
-      return sorted[idx];
+    // Step 2: rolling 3-second min-max normalisation (mirrors Python water script)
+    // Estimate median dt to find how many frames ≈ 3 s.
+    final dts = List<double>.filled(n, 0.02);
+    for (var i = 1; i < n; i++) {
+      dts[i] = (_tr[i] - _tr[i - 1]).clamp(1e-3, 0.05);
+    }
+    final dtSorted = List<double>.from(dts.sublist(1))..sort();
+    final medianDt = dtSorted.isNotEmpty
+        ? dtSorted[dtSorted.length ~/ 2]
+        : 0.02;
+    final windowFrames = math.max(10, (3.0 / medianDt).round());
+    final half = windowFrames ~/ 2;
+
+    final rollMin = List<double>.filled(n, 0.0);
+    final rollMax = List<double>.filled(n, 0.0);
+    for (var i = 0; i < n; i++) {
+      final from = (i - half).clamp(0, n - 1);
+      final to = (i + half).clamp(0, n - 1);
+      double mn = gSmooth[from], mx = gSmooth[from];
+      for (var j = from + 1; j <= to; j++) {
+        if (gSmooth[j] < mn) mn = gSmooth[j];
+        if (gSmooth[j] > mx) mx = gSmooth[j];
+      }
+      rollMin[i] = mn;
+      rollMax[i] = mx;
     }
 
-    final low = pickP(0.05);
-    final high = pickP(0.95);
-    final denom = (high > low) ? (high - low) : 1e-6;
-    _strokeT = List.from(_tr);
-    _strokeSig = List<double>.generate(n, (i) {
-      final v = (gSmooth[i] - low) / denom;
-      return v < 0 ? 0.0 : (v > 1 ? 1.0 : v);
+    final rawSig = List<double>.generate(n, (i) {
+      return ((gSmooth[i] - rollMin[i]) / (rollMax[i] - rollMin[i] + 1e-9))
+          .clamp(0.0, 1.0);
     });
+
+    // Step 3: second MA(5) pass to smooth the normalised signal
+    final sig = ma(rawSig, 5);
+
+    // Step 4: noise gate — zero out frames where smoothed gyro is below
+    //         2× the 30th-percentile noise floor.
+    final gSmoothSorted = List<double>.from(gSmooth)..sort();
+    final noiseFloor =
+        gSmoothSorted[((gSmoothSorted.length - 1) * 0.30).round().clamp(
+          0,
+          gSmoothSorted.length - 1,
+        )];
+    for (var i = 0; i < n; i++) {
+      if (gSmooth[i] < noiseFloor * 2.0) sig[i] = 0.0;
+    }
+
+    _strokeT = List.from(_tr);
+    _strokeSig = sig;
+  }
+
+  void _runPullLengthAnalysis() {
+    if (_t.isEmpty) return;
+
+    // Preprocess once: SLERP-interpolate quaternions + compute global acc.
+    _signalRows = _pld.preprocess(
+      tAcc: _t,
+      ax: _ax,
+      ay: _ay,
+      az: _az,
+      tRot: _tr,
+      qw: _qw,
+      qx: _qx,
+      qy: _qy,
+      qz: _qz,
+    );
+    _signalRowTimes = _signalRows.map((r) => r.timeSec).toList();
+    if (_signalRows.isEmpty) return;
+
+    // Run a filter-only pass (empty peaks) so the chart shows the Butterworth
+    // signal as a preview before replay starts.
+    _pldResult = _pld.process(_signalRows, externalPeakTimes: const []);
+    _pldProcessedRowCount = 0;
+  }
+
+  /// Called every timer tick. Re-runs process() on the accumulated signal slice
+  /// whenever [_pldBlockSize] new rows have been consumed — identical to the
+  /// MATLAB block loop.  Uses the existing [StrokeDetector]'s peaks instead of
+  /// the MATLAB findpeaks so detection quality is consistent across the app.
+  void _maybePldUpdate(double upToTimeSec) {
+    if (_signalRowTimes.isEmpty) return;
+    final rowsConsumed = _lowerBound(_signalRowTimes, upToTimeSec + 1e-9);
+    if (rowsConsumed == 0) return;
+    if (rowsConsumed - _pldProcessedRowCount < _pldBlockSize) return;
+
+    // Only pass peak times that fall within the current accumulated slice.
+    final sliceEnd = _signalRowTimes[rowsConsumed - 1];
+    final peakTimes = _detector.allPeakTimes
+        .where((t) => t <= sliceEnd)
+        .toList();
+
+    _pldResult = _pld.process(
+      _signalRows.sublist(0, rowsConsumed),
+      externalPeakTimes: peakTimes,
+    );
+    _pldProcessedRowCount = rowsConsumed;
   }
 
   int _lowerBound(List<double> a, double x) {
@@ -340,6 +438,10 @@ class _StrokeTestScreenState extends State<StrokeTestScreen> {
     if (_t.isEmpty) return;
     _timer?.cancel();
     _detector.reset();
+
+    // Reset real-time PLD state so the analysis rebuilds from scratch.
+    _pldResult = PullLengthResult.empty;
+    _pldProcessedRowCount = 0;
 
     _i = 0;
     _n = _t.length;
@@ -410,6 +512,9 @@ class _StrokeTestScreenState extends State<StrokeTestScreen> {
         _i++;
       }
 
+      // Block-by-block pull-length update (mirrors the MATLAB block loop).
+      _maybePldUpdate(targetT);
+
       if (mounted) setState(() {});
       if (_i >= _n) _timer?.cancel();
     });
@@ -437,118 +542,317 @@ class _StrokeTestScreenState extends State<StrokeTestScreen> {
         backgroundColor: Colors.blue.shade700,
         foregroundColor: Colors.white,
       ),
-      body: Padding(
+      body: ListView(
         padding: const EdgeInsets.all(16),
-        child: Column(
+        children: [
+          // ── Replay controls ──────────────────────────────────────────────
+          Row(
+            children: [
+              ElevatedButton.icon(
+                onPressed: _startReplay,
+                icon: const Icon(Icons.play_arrow),
+                label: const Text('Start'),
+              ),
+              const SizedBox(width: 8),
+              ElevatedButton.icon(
+                onPressed: _stopReplay,
+                icon: const Icon(Icons.stop),
+                label: const Text('Stop'),
+              ),
+              const SizedBox(width: 16),
+              const Text('Speed:'),
+              const SizedBox(width: 8),
+              DropdownButton<double>(
+                value: _speed,
+                items: const [
+                  DropdownMenuItem(value: 0.5, child: Text('0.5x')),
+                  DropdownMenuItem(value: 1.0, child: Text('1.0x')),
+                  DropdownMenuItem(value: 2.0, child: Text('2.0x')),
+                ],
+                onChanged: (v) => setState(() => _speed = v ?? 1.0),
+              ),
+            ],
+          ),
+          const SizedBox(height: 16),
+
+          // ── Live replay metrics ──────────────────────────────────────────
+          Row(
+            children: [
+              _metricCard(
+                'Stroke Rate',
+                '${_rateSpm.toStringAsFixed(1)} spm',
+                Icons.speed,
+              ),
+              const SizedBox(width: 12),
+              _metricCard(
+                'Total Strokes',
+                '$_totalStrokes',
+                Icons.fitness_center,
+              ),
+              const SizedBox(width: 12),
+              _metricCard(
+                'Mean Pull Length',
+                _pldResult.meanPullLength > 0
+                    ? '${_pldResult.meanPullLength.toStringAsFixed(2)} m'
+                    : '—',
+                Icons.straighten,
+                color: Colors.purple.shade700,
+              ),
+            ],
+          ),
+          const SizedBox(height: 16),
+
+          // ── Live acceleration magnitude graph (rolling window) ───────────
+          _chartCard(child: _buildAccelChart()),
+          const SizedBox(height: 16),
+
+          // ── 3D paddle replay ─────────────────────────────────────────────
+          _chartCard(
+            child: AbsorbPointer(
+              absorbing: true,
+              child: Cube(
+                onSceneCreated: (scene) {
+                  scene.camera.zoom = 14;
+                  final obj = Object(fileName: 'assets/models/paddle.obj');
+                  try {
+                    obj.scale.setValues(0.8, 0.8, 0.8);
+                  } catch (_) {}
+                  scene.world.add(obj);
+                  _paddleObj = obj;
+                },
+              ),
+            ),
+          ),
+          const SizedBox(height: 8),
+
+          // Replay progress label.
+          Center(
+            child: Text(
+              _i < _n
+                  ? 't=${_t[_i.clamp(0, _n - 1)].toStringAsFixed(2)}s'
+                  : 'Replay finished',
+              style: const TextStyle(fontSize: 16),
+            ),
+          ),
+          const SizedBox(height: 24),
+
+          // ── Pull-length analysis (static, whole-signal) ──────────────────
+          _buildPullLengthSection(),
+          const SizedBox(height: 24),
+        ],
+      ),
+    );
+  }
+
+  // ── Pull-length section ──────────────────────────────────────────────────
+
+  Widget _buildPullLengthSection() {
+    final r = _pldResult;
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
           children: [
-            Row(
-              children: [
-                ElevatedButton.icon(
-                  onPressed: _startReplay,
-                  icon: const Icon(Icons.play_arrow),
-                  label: const Text('Start'),
-                ),
-                const SizedBox(width: 8),
-                ElevatedButton.icon(
-                  onPressed: _stopReplay,
-                  icon: const Icon(Icons.stop),
-                  label: const Text('Stop'),
-                ),
-                const SizedBox(width: 16),
-                const Text('Speed:'),
-                const SizedBox(width: 8),
-                DropdownButton<double>(
-                  value: _speed,
-                  items: const [
-                    DropdownMenuItem(value: 0.5, child: Text('0.5x')),
-                    DropdownMenuItem(value: 1.0, child: Text('1.0x')),
-                    DropdownMenuItem(value: 2.0, child: Text('2.0x')),
-                  ],
-                  onChanged: (v) => setState(() => _speed = v ?? 1.0),
-                ),
-              ],
+            Icon(
+              Icons.analytics_outlined,
+              color: Colors.purple.shade700,
+              size: 20,
             ),
-            const SizedBox(height: 16),
-            Row(
-              children: [
-                _metricCard(
-                  'Stroke Rate',
-                  '${_rateSpm.toStringAsFixed(1)} spm',
-                  Icons.speed,
-                ),
-                const SizedBox(width: 12),
-                _metricCard(
-                  'Total Strokes',
-                  '$_totalStrokes',
-                  Icons.fitness_center,
-                ),
-              ],
-            ),
-            const SizedBox(height: 16),
-            // Live acceleration magnitude graph (rolling window)
-            Container(
-              height: 220,
-              padding: const EdgeInsets.all(12),
-              decoration: BoxDecoration(
-                color: Colors.white,
-                borderRadius: BorderRadius.circular(12),
-                boxShadow: [
-                  BoxShadow(
-                    color: Colors.black.withOpacity(0.05),
-                    blurRadius: 4,
-                    offset: const Offset(0, 2),
-                  ),
-                ],
-              ),
-              child: _buildAccelChart(),
-            ),
-            const SizedBox(height: 16),
-            // 3D paddle replay (rotation from quaternion timeline)
-            Container(
-              height: 220,
-              padding: const EdgeInsets.all(12),
-              decoration: BoxDecoration(
-                color: Colors.white,
-                borderRadius: BorderRadius.circular(12),
-                boxShadow: [
-                  BoxShadow(
-                    color: Colors.black.withOpacity(0.05),
-                    blurRadius: 4,
-                    offset: const Offset(0, 2),
-                  ),
-                ],
-              ),
-              child: AbsorbPointer(
-                absorbing: true, // disable user interactions; we drive it
-                child: Cube(
-                  onSceneCreated: (scene) {
-                    scene.camera.zoom =
-                        14; // further out so model stays in view
-                    final obj = Object(fileName: 'assets/models/paddle.obj');
-                    // Slight downscale to reduce chance of clipping out of frame
-                    try {
-                      obj.scale.setValues(0.8, 0.8, 0.8);
-                    } catch (_) {}
-                    scene.world.add(obj);
-                    _paddleObj = obj;
-                  },
-                ),
-              ),
-            ),
-            const SizedBox(height: 16),
-            Expanded(
-              child: Center(
-                child: Text(
-                  _i < _n
-                      ? 't=${_t[_i.clamp(0, _n - 1)].toStringAsFixed(2)}s'
-                      : 'Replay finished',
-                  style: const TextStyle(fontSize: 18),
-                ),
+            const SizedBox(width: 6),
+            Text(
+              'Pull-Length Analysis',
+              style: TextStyle(
+                fontSize: 15,
+                fontWeight: FontWeight.w600,
+                color: Colors.purple.shade700,
               ),
             ),
           ],
         ),
+        const SizedBox(height: 10),
+
+        if (r.filteredAccZ.isNotEmpty) ...[
+          _chartCard(child: _buildPldChart()),
+          const SizedBox(height: 6),
+          Padding(
+            padding: const EdgeInsets.only(left: 4),
+            child: Text(
+              'Filtered −Z acc (blue) · stroke peaks (purple) · pull length (orange)',
+              style: TextStyle(fontSize: 10, color: Colors.grey.shade600),
+            ),
+          ),
+        ] else
+          Container(
+            height: 80,
+            alignment: Alignment.center,
+            child: Text(
+              _tr.isEmpty
+                  ? 'No rotation data — pull-length unavailable'
+                  : 'Press Start to begin analysis',
+              style: TextStyle(color: Colors.grey.shade500, fontSize: 13),
+            ),
+          ),
+      ],
+    );
+  }
+
+  Widget _buildPldChart() {
+    final r = _pldResult;
+    final sig = r.filteredAccZ;
+    final n = sig.length;
+    if (n == 0) return const SizedBox.shrink();
+
+    // Downsample for display performance (target ≤1000 points).
+    const kMaxPts = 1000;
+    final step = math.max(1, n ~/ kMaxPts);
+
+    // Map sample index → time using the acceleration timeline.
+    double timeAt(int i) => (i < _t.length) ? _t[i] : i.toDouble();
+
+    final linePts = <FlSpot>[
+      for (int i = 0; i < n; i += step) FlSpot(timeAt(i), sig[i]),
+    ];
+
+    // Peak markers at detected stroke positions.
+    final peakPts = [
+      for (int k = 0; k < r.peakIndices.length; k++)
+        FlSpot(r.peakTimes[k], r.peakValues[k]),
+    ];
+
+    // Pull-length series: one dot per stroke, value scaled to the acc axis.
+    // Scale pull lengths so they fit nicely in the chart (Y range ≈ ±max(sig)).
+    final maxSig = sig.fold<double>(0.0, (m, v) => v > m ? v : m);
+    final maxPl = r.pullLengths.fold<double>(0.01, (m, v) => v > m ? v : m);
+    final plScale = maxSig > 0 && maxPl > 0 ? maxSig * 0.8 / maxPl : 1.0;
+    final plPts = [
+      for (int k = 0; k < r.peakIndices.length; k++)
+        FlSpot(r.peakTimes[k], r.pullLengths[k] * plScale),
+    ];
+
+    final minX = linePts.first.x;
+    final maxX = linePts.last.x;
+    final yPad = maxSig * 0.1;
+
+    return LineChart(
+      LineChartData(
+        gridData: FlGridData(
+          show: true,
+          drawVerticalLine: false,
+          horizontalInterval: math.max(0.5, maxSig / 4).roundToDouble(),
+          getDrawingHorizontalLine: (v) =>
+              FlLine(color: Colors.grey.shade200, strokeWidth: 1),
+        ),
+        titlesData: FlTitlesData(
+          topTitles: const AxisTitles(
+            sideTitles: SideTitles(showTitles: false),
+          ),
+          rightTitles: const AxisTitles(
+            sideTitles: SideTitles(showTitles: false),
+          ),
+          bottomTitles: AxisTitles(
+            sideTitles: SideTitles(
+              showTitles: true,
+              reservedSize: 22,
+              interval: math.max(1.0, (maxX - minX) / 5).roundToDouble(),
+              getTitlesWidget: (v, _) => Text(
+                '${v.toStringAsFixed(0)}s',
+                style: TextStyle(fontSize: 9, color: Colors.grey.shade600),
+              ),
+            ),
+          ),
+          leftTitles: AxisTitles(
+            sideTitles: SideTitles(
+              showTitles: true,
+              reservedSize: 32,
+              interval: math.max(0.5, maxSig / 4).roundToDouble(),
+              getTitlesWidget: (v, _) => Text(
+                v.toStringAsFixed(1),
+                style: TextStyle(fontSize: 9, color: Colors.grey.shade600),
+              ),
+            ),
+          ),
+        ),
+        borderData: FlBorderData(
+          show: true,
+          border: Border.all(color: Colors.grey.shade300),
+        ),
+        minX: minX,
+        maxX: maxX,
+        minY: -yPad,
+        maxY: maxSig + yPad,
+        clipData: FlClipData.all(),
+        lineBarsData: [
+          // Filtered −Z acc (blue line).
+          LineChartBarData(
+            spots: linePts,
+            isCurved: true,
+            curveSmoothness: 0.2,
+            color: Colors.blue.shade500,
+            barWidth: 1.5,
+            dotData: const FlDotData(show: false),
+            belowBarData: BarAreaData(
+              show: true,
+              color: Colors.blue.shade500.withValues(alpha: 0.07),
+            ),
+          ),
+          // Pull lengths scaled to the acc axis (orange dots).
+          if (plPts.isNotEmpty)
+            LineChartBarData(
+              spots: plPts,
+              isCurved: false,
+              color: Colors.orange.shade600,
+              barWidth: 0,
+              dotData: FlDotData(
+                show: true,
+                getDotPainter: (spot, pct, bar, idx) => FlDotCirclePainter(
+                  radius: 5,
+                  color: Colors.orange.shade600,
+                  strokeWidth: 1.5,
+                  strokeColor: Colors.white,
+                ),
+              ),
+            ),
+          // Peak markers (purple triangles approximated as larger dots).
+          if (peakPts.isNotEmpty)
+            LineChartBarData(
+              spots: peakPts,
+              isCurved: false,
+              color: Colors.purple.shade600,
+              barWidth: 0,
+              dotData: FlDotData(
+                show: true,
+                getDotPainter: (spot, pct, bar, idx) => FlDotCirclePainter(
+                  radius: 4,
+                  color: Colors.purple.shade600,
+                  strokeWidth: 1.5,
+                  strokeColor: Colors.white,
+                ),
+              ),
+            ),
+        ],
       ),
+    );
+  }
+
+  // ── Shared card helpers ──────────────────────────────────────────────────
+
+  Widget _chartCard({required Widget child}) {
+    return Container(
+      height: 220,
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(12),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withValues(alpha: 0.05),
+            blurRadius: 4,
+            offset: const Offset(0, 2),
+          ),
+        ],
+      ),
+      child: child,
     );
   }
 
@@ -629,41 +933,45 @@ class _StrokeTestScreenState extends State<StrokeTestScreen> {
     );
   }
 
-  Widget _metricCard(String title, String value, IconData icon) {
+  Widget _metricCard(
+    String title,
+    String value,
+    IconData icon, {
+    Color? color,
+  }) {
+    final iconColor = color ?? Colors.blue.shade700;
     return Expanded(
       child: Container(
-        padding: const EdgeInsets.all(16),
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 12),
         decoration: BoxDecoration(
           color: Colors.white,
           borderRadius: BorderRadius.circular(12),
           boxShadow: [
             BoxShadow(
-              color: Colors.black.withOpacity(0.05),
+              color: Colors.black.withValues(alpha: 0.05),
               blurRadius: 4,
               offset: const Offset(0, 2),
             ),
           ],
         ),
-        child: Row(
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Icon(icon, color: Colors.blue.shade700),
-            const SizedBox(width: 12),
-            Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  value,
-                  style: const TextStyle(
-                    fontSize: 20,
-                    fontWeight: FontWeight.bold,
-                  ),
-                ),
-                const SizedBox(height: 4),
-                Text(
-                  title,
-                  style: TextStyle(fontSize: 12, color: Colors.grey.shade700),
-                ),
-              ],
+            Icon(icon, color: iconColor, size: 18),
+            const SizedBox(height: 6),
+            Text(
+              value,
+              style: const TextStyle(
+                fontSize: 14,
+                fontWeight: FontWeight.bold,
+              ),
+              overflow: TextOverflow.ellipsis,
+            ),
+            const SizedBox(height: 2),
+            Text(
+              title,
+              style: TextStyle(fontSize: 10, color: Colors.grey.shade600),
+              overflow: TextOverflow.ellipsis,
             ),
           ],
         ),

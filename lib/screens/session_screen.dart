@@ -5,15 +5,12 @@ import '../models/session.dart';
 import '../models/paddler.dart';
 import '../widgets/force_graph_widget.dart';
 import '../widgets/historical_force_graph_widget.dart';
-import '../widgets/insights_section.dart';
-import '../widgets/paddler_dashboard.dart';
 import '../providers/paddler_provider.dart';
 import '../providers/ble_provider.dart';
 import '../services/csv_logger.dart';
 import '../services/session_storage.dart';
 import '../services/stroke_detector.dart';
-import '../services/paddle_orientation.dart';
-import 'package:flutter_cube/flutter_cube.dart';
+import '../services/pull_length_detector.dart';
 import 'dart:math' show sqrt, acos, pi;
 import 'dart:io';
 import 'package:path_provider/path_provider.dart';
@@ -39,16 +36,15 @@ class _SessionScreenState extends State<SessionScreen> {
   Timer? _durationTimer;
   Map<String, List<AccelDataPoint>>? _historicalData;
   bool _isLoadingHistoricalData = false;
-  List<Paddler> _replayPaddlers = []; // Paddlers updated during replay
   bool get _isPastSession => widget.session.id != 'session_new';
 
   // Live stroke metrics
   final StrokeDetector _strokeDetector = StrokeDetector(
     windowSec: 5.0,
-    minPeakDistanceSec: 0.62,
+    minPeakDistanceSec: 0.80,
     smoothingAlpha: 0.1,
     baselineAlpha: 0.05,
-    thresholdMin: 0.57,
+    thresholdMin: 0.55,
     thresholdK: 1.0,
     warmupSec: 0.5,
   );
@@ -57,29 +53,64 @@ class _SessionScreenState extends State<SessionScreen> {
   int? _t0Us;
   bool _strokeCountingEnabled = false;
 
-  // Live quaternion buffer for 3D
+  // Pull-length detection
+  final PullLengthDetector _pld = const PullLengthDetector();
+  double _liveMeanPullLength = 0.0;
+  double _histAvgAccel = 0.0;
+
+  // Live acc buffer for PLD (accumulates from recording start, cleared on stop)
+  final List<double> _pldAccT = [];
+  final List<double> _pldAccX = [];
+  final List<double> _pldAccY = [];
+  final List<double> _pldAccZ = [];
+  // Full quat buffer for PLD (no size cap unlike _qt which is for 3D only)
+  final List<double> _pldQt = [];
+  final List<double> _pldQw = [];
+  final List<double> _pldQx = [];
+  final List<double> _pldQy = [];
+  final List<double> _pldQz = [];
+  int _pldAccProcessedCount = 0;
+  static const int _pldBlockSize = 20;
+
+  // Historical raw acc components parsed from CSV for PLD preprocessing
+  final List<double> _histAccT = [];
+  final List<double> _histAccX = [];
+  final List<double> _histAccY = [];
+  final List<double> _histAccZ = [];
+
+  // Pre-computed per-sample metrics timeline (parallel to _replayStrokeT).
+  // Used for fast O(log n) lookup during graph replay.
+  List<double> _histTimelineSpm = [];
+  List<int> _histTimelineCount = [];
+  // Accel magnitude timeline for the first paddler (fast lookup by replay time).
+  List<double> _histAccelT = [];
+  List<double> _histAccelV = [];
+
+  // Dynamic values shown while the historical graph replays.
+  double _dynAccel = 0.0;
+  double _dynSpm = 0.0;
+  int _dynStrokes = 0;
+  double _dynPullLength = 0.0;
+
+  // Per-stroke pull length timeline (from PLD result) for dynamic replay lookup.
+  List<double> _histPeakTimes = [];
+  List<double> _histPullLengths = [];
+
+  // Live quaternion buffer for 3D (capped rolling window used for gyro signal)
   final List<double> _qt = [];
   final List<double> _qw = [];
   final List<double> _qx = [];
   final List<double> _qy = [];
   final List<double> _qz = [];
   static const int _maxQuatSamples = 512;
-  PaddleOrientation? _livePaddle;
-  Object? _paddleObj;
-  Timer? _renderTimer;
   StreamSubscription<SensorData>? _liveBleSub;
 
-  // Replay 3D buffers
+  // Replay quat buffers — used for gyro stroke signal and PLD preprocessing
   final List<double> _rt = [];
   final List<double> _rqw = [];
   final List<double> _rqx = [];
   final List<double> _rqy = [];
   final List<double> _rqz = [];
-  PaddleOrientation? _replayPaddle;
-  Object? _replayObj;
-  Timer? _replayTimer;
-  double _replayT = 0.0;
-  double _replayTMax = 0.0;
 
   // Replay gyro-based stroke signal (mirrors test screen's _strokeT/_strokeSig)
   List<double> _replayStrokeT = [];
@@ -120,8 +151,6 @@ class _SessionScreenState extends State<SessionScreen> {
         setState(() {
           _historicalData = data;
           _isLoadingHistoricalData = false;
-          // Initialize replay paddlers with session paddlers
-          _replayPaddlers = List.from(widget.session.paddlers);
         });
       }
 
@@ -205,6 +234,19 @@ class _SessionScreenState extends State<SessionScreen> {
     _prevQt = null;
     _prevQw = _prevQx = _prevQy = _prevQz = null;
     _gyroMag.clear();
+
+    // Reset PLD buffers.
+    _pldAccT.clear();
+    _pldAccX.clear();
+    _pldAccY.clear();
+    _pldAccZ.clear();
+    _pldQt.clear();
+    _pldQw.clear();
+    _pldQx.clear();
+    _pldQy.clear();
+    _pldQz.clear();
+    _pldAccProcessedCount = 0;
+    _liveMeanPullLength = 0.0;
 
     paddlerProvider.startRecording();
     // Pass a function to get fresh paddler data each time
@@ -332,7 +374,6 @@ class _SessionScreenState extends State<SessionScreen> {
     // Don't save CSV on dispose - only save when user explicitly stops recording
     // _csvLogger.stopLogging(); // Removed to prevent duplicate saves
     _liveBleSub?.cancel();
-    _renderTimer?.cancel();
     super.dispose();
   }
 
@@ -574,7 +615,6 @@ class _SessionScreenState extends State<SessionScreen> {
   }
 
   Widget _buildMainContent() {
-    // For past sessions, use session data; for new sessions, use provider
     if (_isPastSession) {
       if (_isLoadingHistoricalData) {
         return const Center(child: CircularProgressIndicator());
@@ -586,27 +626,43 @@ class _SessionScreenState extends State<SessionScreen> {
       return ListView(
         padding: const EdgeInsets.all(16.0),
         children: [
-          // Key Metrics Section
           _buildMetricsSectionForPastSession(duration, paddlers.length),
           const SizedBox(height: 16),
-          // Replay Stroke Metrics (first paddler)
-          if (_historicalData != null && _historicalData!.isNotEmpty)
-            _buildSectionCard(
-              title: 'Stroke (Replay)',
-              child: _buildReplayStrokeMetrics(),
-            ),
-          if (_historicalData != null && _historicalData!.isNotEmpty)
-            const SizedBox(height: 16),
-          // Paddler Dashboard
-          _buildSectionCard(
-            title: 'Paddler Dashboard',
-            child: PaddlerDashboard(
-              paddlers: _replayPaddlers.isNotEmpty ? _replayPaddlers : paddlers,
-              isRecording: false,
-            ),
+          // 4 replay-driven metric cards (update live as graph replays)
+          Row(
+            children: [
+              _buildCompactMetricCard(
+                'Accel',
+                _dynAccel > 0
+                    ? '${_dynAccel.toStringAsFixed(1)} m/s²'
+                    : '—',
+                Icons.speed,
+              ),
+              const SizedBox(width: 8),
+              _buildCompactMetricCard(
+                'Stroke Rate',
+                _dynSpm > 0 ? '${_dynSpm.toStringAsFixed(1)} spm' : '—',
+                Icons.fitness_center,
+              ),
+              const SizedBox(width: 8),
+              _buildCompactMetricCard(
+                'Strokes',
+                '$_dynStrokes',
+                Icons.countertops,
+              ),
+              const SizedBox(width: 8),
+              _buildCompactMetricCard(
+                'Pull Length',
+                _dynPullLength > 0
+                    ? '${_dynPullLength.toStringAsFixed(2)} m'
+                    : '—',
+                Icons.straighten,
+                iconColor: Colors.purple.shade700,
+              ),
+            ],
           ),
           const SizedBox(height: 16),
-          // Force Graph
+          // Acceleration graph — full session width, data fills left-to-right
           _buildSectionCard(
             title: 'Acceleration (m/s²)',
             child: _historicalData != null
@@ -614,48 +670,16 @@ class _SessionScreenState extends State<SessionScreen> {
                     key: ValueKey('historical_${widget.session.id}'),
                     paddlers: paddlers,
                     historicalData: _historicalData!,
-                    onReplayUpdate: (updatedPaddlers) {
-                      // Update replay paddlers during replay
-                      if (mounted) {
-                        setState(() {
-                          _replayPaddlers = updatedPaddlers;
-                        });
-                      }
-                    },
+                    onReplayTick: _onHistReplayTick,
                   )
                 : const Center(child: Text('No historical data available')),
-          ),
-          const SizedBox(height: 16),
-          // 3D Replay (if available)
-          if (_replayPaddle != null)
-            _buildSectionCard(
-              title: '3D Replay',
-              child: SizedBox(
-                height: 220,
-                child: Cube(
-                  interactive: false,
-                  onSceneCreated: (scene) {
-                    scene.camera.zoom = 8;
-                    final obj = Object(fileName: 'assets/models/paddle.obj');
-                    _replayObj = obj;
-                    scene.world.add(obj);
-                    _ensureReplayTimer();
-                  },
-                ),
-              ),
-            ),
-          if (_replayPaddle != null) const SizedBox(height: 16),
-          // Insights Section
-          _buildSectionCard(
-            title: 'ML Insights',
-            child: InsightsSection(paddlers: paddlers),
           ),
           const SizedBox(height: 16),
         ],
       );
     }
 
-    // For new/active sessions
+    // Live / active recording session
     return Consumer<PaddlerProvider>(
       builder: (context, paddlerProvider, child) {
         final paddlers = paddlerProvider.paddlers;
@@ -663,68 +687,47 @@ class _SessionScreenState extends State<SessionScreen> {
         final duration = _sessionStartTime != null
             ? DateTime.now().difference(_sessionStartTime!)
             : const Duration();
+        final currentAccel =
+            paddlers.isNotEmpty ? paddlers.first.currentForce : 0.0;
 
         return ListView(
           padding: const EdgeInsets.all(16.0),
           children: [
-            // Key Metrics Section
             _buildMetricsSection(duration, isRecording),
             const SizedBox(height: 16),
-            // Paddler Dashboard
-            _buildSectionCard(
-              title: 'Paddler Dashboard',
-              child: PaddlerDashboard(
-                paddlers: paddlers,
-                isRecording: isRecording,
-              ),
+            // 4 live metric cards
+            Row(
+              children: [
+                _buildCompactMetricCard(
+                  'Accel',
+                  '${currentAccel.toStringAsFixed(1)} m/s²',
+                  Icons.speed,
+                ),
+                const SizedBox(width: 8),
+                _buildCompactMetricCard(
+                  'Stroke Rate',
+                  '${_liveSpm.toStringAsFixed(1)} spm',
+                  Icons.fitness_center,
+                ),
+                const SizedBox(width: 8),
+                _buildCompactMetricCard(
+                  'Strokes',
+                  '$_liveTotalStrokes',
+                  Icons.countertops,
+                ),
+                const SizedBox(width: 8),
+                _buildCompactMetricCard(
+                  'Pull Length',
+                  _liveMeanPullLength > 0
+                      ? '${_liveMeanPullLength.toStringAsFixed(2)} m'
+                      : '—',
+                  Icons.straighten,
+                  iconColor: Colors.purple.shade700,
+                ),
+              ],
             ),
             const SizedBox(height: 16),
-            // Live Stroke Metrics + 3D View
-            _buildSectionCard(
-              title: 'Stroke & 3D',
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Row(
-                    children: [
-                      Expanded(
-                        child: _buildMetricCard(
-                          label: 'SPM',
-                          value: _liveSpm.toStringAsFixed(1),
-                          icon: Icons.fitness_center,
-                        ),
-                      ),
-                      const SizedBox(width: 12),
-                      Expanded(
-                        child: _buildMetricCard(
-                          label: 'Strokes',
-                          value: '$_liveTotalStrokes',
-                          icon: Icons.countertops,
-                        ),
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 12),
-                  SizedBox(
-                    height: 220,
-                    child: Cube(
-                      interactive: false,
-                      onSceneCreated: (scene) {
-                        scene.camera.zoom = 8;
-                        final obj = Object(
-                          fileName: 'assets/models/paddle.obj',
-                        );
-                        _paddleObj = obj;
-                        scene.world.add(obj);
-                        _ensureRenderTimer();
-                      },
-                    ),
-                  ),
-                ],
-              ),
-            ),
-            const SizedBox(height: 16),
-            // Force Graph
+            // Acceleration graph
             _buildSectionCard(
               title: 'Acceleration (m/s²)',
               child: ForceGraphWidget(
@@ -732,12 +735,6 @@ class _SessionScreenState extends State<SessionScreen> {
                 paddlers: paddlers,
                 isRecording: isRecording,
               ),
-            ),
-            const SizedBox(height: 16),
-            // Insights Section
-            _buildSectionCard(
-              title: 'ML Insights',
-              child: InsightsSection(paddlers: paddlers),
             ),
             const SizedBox(height: 16),
           ],
@@ -884,6 +881,52 @@ class _SessionScreenState extends State<SessionScreen> {
     );
   }
 
+  /// Compact 4-per-row metric card used in the live and history views.
+  Widget _buildCompactMetricCard(
+    String label,
+    String value,
+    IconData icon, {
+    Color? iconColor,
+  }) {
+    return Expanded(
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 10),
+        decoration: BoxDecoration(
+          color: Colors.white,
+          borderRadius: BorderRadius.circular(10),
+          boxShadow: [
+            BoxShadow(
+              color: Colors.black.withValues(alpha: 0.05),
+              blurRadius: 4,
+              offset: const Offset(0, 2),
+            ),
+          ],
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Icon(icon, size: 16, color: iconColor ?? Colors.blue.shade600),
+            const SizedBox(height: 4),
+            Text(
+              value,
+              style: const TextStyle(
+                fontSize: 13,
+                fontWeight: FontWeight.bold,
+              ),
+              overflow: TextOverflow.ellipsis,
+            ),
+            const SizedBox(height: 2),
+            Text(
+              label,
+              style: TextStyle(fontSize: 9, color: Colors.grey.shade600),
+              overflow: TextOverflow.ellipsis,
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   Widget _buildSectionCard({required String title, required Widget child}) {
     return Container(
       padding: const EdgeInsets.all(16),
@@ -964,31 +1007,43 @@ class _SessionScreenState extends State<SessionScreen> {
       if (evt.dataType == 0.0) {
         // Acceleration row -> stroke detector (ONLY when recording is active)
         if (_strokeCountingEnabled) {
+          // Buffer raw components for pull-length detection.
+          _pldAccT.add(tSec);
+          _pldAccX.add(evt.accX);
+          _pldAccY.add(evt.accY);
+          _pldAccZ.add(evt.accZ);
+
           // Prefer gyro-based stroke signal if available, else fallback to |a|
           double? sig;
           if (_gyroMag.isNotEmpty) {
-            // Smooth with small trailing average (~11)
-            final w = 11;
+            // Trailing MA(15) of gyro magnitude (water-stroke smooth window)
+            const w = 15;
             final cnt = _gyroMag.length < w ? _gyroMag.length : w;
             double s = 0.0;
             for (int i = 0; i < cnt; i++) {
               s += _gyroMag[_gyroMag.length - 1 - i];
             }
             final gSmooth = s / (cnt > 0 ? cnt : 1);
-            final copy = List<double>.from(_gyroMag)..sort();
-            double pick(double p) {
-              if (copy.isEmpty) return 0.0;
-              final idx = ((copy.length - 1) * p).round().clamp(
-                0,
-                copy.length - 1,
-              );
-              return copy[idx];
-            }
 
-            final low = pick(0.05);
-            final high = pick(0.95);
-            final denom = (high > low) ? (high - low) : 1e-6;
-            sig = ((gSmooth - low) / denom).clamp(0.0, 1.0);
+            // Rolling 3-second local min-max over the buffer window.
+            // At ~20 Hz quaternion rate, 3 s ≈ 60 samples.
+            const roll = 60;
+            final from = _gyroMag.length > roll ? _gyroMag.length - roll : 0;
+            double mn = _gyroMag[from], mx = _gyroMag[from];
+            for (int i = from + 1; i < _gyroMag.length; i++) {
+              if (_gyroMag[i] < mn) mn = _gyroMag[i];
+              if (_gyroMag[i] > mx) mx = _gyroMag[i];
+            }
+            final normSig = ((gSmooth - mn) / (mx - mn + 1e-9)).clamp(0.0, 1.0);
+
+            // Noise gate: 30th-percentile of buffer × 2.0
+            final bufSorted = List<double>.from(_gyroMag)..sort();
+            final noiseFloor =
+                bufSorted[((bufSorted.length - 1) * 0.30).round().clamp(
+                  0,
+                  bufSorted.length - 1,
+                )];
+            sig = gSmooth < noiseFloor * 2.0 ? 0.0 : normSig;
           }
           final mag = sqrt(
             evt.accX * evt.accX + evt.accY * evt.accY + evt.accZ * evt.accZ,
@@ -997,6 +1052,8 @@ class _SessionScreenState extends State<SessionScreen> {
             tSec: tSec,
             accelMag: sig ?? mag,
           );
+          // Block-by-block pull-length update.
+          _maybeLivePldUpdate(tSec);
           if (mounted) {
             setState(() {
               _liveSpm = upd.rateSpm;
@@ -1085,6 +1142,12 @@ class _SessionScreenState extends State<SessionScreen> {
         _prevQx = evt.qi;
         _prevQy = evt.qj;
         _prevQz = evt.qk;
+        // Buffer full quat timeline for PLD (no size cap).
+        _pldQt.add(tSec);
+        _pldQw.add(evt.qw);
+        _pldQx.add(evt.qi);
+        _pldQy.add(evt.qj);
+        _pldQz.add(evt.qk);
         // Trim buffers
         if (_qt.length > _maxQuatSamples) {
           final drop = _qt.length - _maxQuatSamples;
@@ -1094,100 +1157,31 @@ class _SessionScreenState extends State<SessionScreen> {
           _qy.removeRange(0, drop);
           _qz.removeRange(0, drop);
         }
-        // Rebuild orientation with current buffers
-        if (_qt.length >= 2) {
-          _livePaddle = PaddleOrientation(
-            tSec: List<double>.from(_qt),
-            qw: List<double>.from(_qw),
-            qx: List<double>.from(_qx),
-            qy: List<double>.from(_qy),
-            qz: List<double>.from(_qz),
-            fixedXDeg: 0.0,
-            fixedYDeg: 45.0,
-            fixedZDeg: 90.0,
-            yawOnly: true,
-          );
-        }
       }
     });
   }
 
-  void _ensureRenderTimer() {
-    _renderTimer ??= Timer.periodic(const Duration(milliseconds: 33), (_) {
-      if (_paddleObj == null || _livePaddle == null || _qt.isEmpty) return;
-      // Drive using latest timestamp in buffer
-      final t = _qt.isNotEmpty ? _qt.last : 0.0;
-      final e = _livePaddle!.eulerAt(t);
-      _paddleObj!.rotation.setValues(e.x, e.y, e.z);
-      _paddleObj!.updateTransform();
-    });
-  }
-
-  Widget _buildReplayStrokeMetrics() {
-    final firstKey = _historicalData!.keys.first;
-    final series = _historicalData![firstKey]!;
-    if (series.isEmpty) {
-      return const Text('No data');
-    }
-
-    final det = StrokeDetector(
-      windowSec: 5.0,
-      minPeakDistanceSec: 0.62,
-      smoothingAlpha: 0.1,
-      baselineAlpha: 0.05,
-      thresholdMin: 0.57,
-      thresholdK: 1.0,
-      warmupSec: 0.5,
+  void _maybeLivePldUpdate(double tSec) {
+    if (_pldAccT.length - _pldAccProcessedCount < _pldBlockSize) return;
+    if (_pldQt.isEmpty) return;
+    final rows = _pld.preprocess(
+      tAcc: List<double>.from(_pldAccT),
+      ax: List<double>.from(_pldAccX),
+      ay: List<double>.from(_pldAccY),
+      az: List<double>.from(_pldAccZ),
+      tRot: List<double>.from(_pldQt),
+      qw: List<double>.from(_pldQw),
+      qx: List<double>.from(_pldQx),
+      qy: List<double>.from(_pldQy),
+      qz: List<double>.from(_pldQz),
     );
-
-    int total = 0;
-    double lastSpm = 0.0;
-
-    final hasGyroSignal =
-        _replayStrokeT.isNotEmpty && _replayStrokeSig.isNotEmpty;
-
-    // Compute metrics only up to the current replay time so replay starts at zero.
-    final tLimit = _replayT;
-    for (final p in series) {
-      if (p.time > tLimit) break;
-      double sig;
-      if (hasGyroSignal) {
-        // Nearest-neighbour lookup on gyro stroke signal — identical to test screen replay
-        var j = _lowerBound(_replayStrokeT, p.time);
-        if (j > 0 && j < _replayStrokeT.length) {
-          final prev = (p.time - _replayStrokeT[j - 1]).abs();
-          final next = (_replayStrokeT[j] - p.time).abs();
-          if (prev <= next) j = j - 1;
-        } else if (j >= _replayStrokeT.length) {
-          j = _replayStrokeT.length - 1;
-        }
-        sig = _replayStrokeSig[j];
-      } else {
-        sig = p.accel; // fallback for old-format sessions
-      }
-      final upd = det.addSample(tSec: p.time, accelMag: sig);
-      total = upd.totalStrokes;
-      lastSpm = upd.rateSpm;
-    }
-    return Row(
-      children: [
-        Expanded(
-          child: _buildMetricCard(
-            label: 'SPM (last window)',
-            value: lastSpm.toStringAsFixed(1),
-            icon: Icons.fitness_center,
-          ),
-        ),
-        const SizedBox(width: 12),
-        Expanded(
-          child: _buildMetricCard(
-            label: 'Total Strokes',
-            value: '$total',
-            icon: Icons.countertops,
-          ),
-        ),
-      ],
-    );
+    if (rows.isEmpty) return;
+    final peaks = _strokeDetector.allPeakTimes
+        .where((t) => t <= tSec)
+        .toList();
+    final result = _pld.process(rows, externalPeakTimes: peaks);
+    _liveMeanPullLength = result.meanPullLength;
+    _pldAccProcessedCount = _pldAccT.length;
   }
 
   // ------------ Replay 3D parsing & animation ------------
@@ -1212,6 +1206,10 @@ class _SessionScreenState extends State<SessionScreen> {
       _rqx.clear();
       _rqy.clear();
       _rqz.clear();
+      _histAccT.clear();
+      _histAccX.clear();
+      _histAccY.clear();
+      _histAccZ.clear();
 
       // Find global t0 across ALL rows (accel + quat) so timelines align.
       double? t0Us;
@@ -1224,45 +1222,166 @@ class _SessionScreenState extends State<SessionScreen> {
       }
       if (t0Us == null) return;
 
+      // Single pass: parse both quat (type 1) and acc (type 0) rows.
       for (var i = 1; i < lines.length; i++) {
         final parts = lines[i].split(',');
         if (parts.length < 7) continue;
         final dataType = double.tryParse(parts[2]);
-        if (dataType == null || dataType != 1.0) continue;
         final timeUs = double.tryParse(parts[0]);
-        if (timeUs == null) continue;
+        if (dataType == null || timeUs == null) continue;
         final tSec = (timeUs - t0Us) / 1e6;
-        final qw = double.tryParse(parts[3]) ?? 0.0;
-        final qi = double.tryParse(parts[4]) ?? 0.0;
-        final qj = double.tryParse(parts[5]) ?? 0.0;
-        final qk = double.tryParse(parts[6]) ?? 0.0;
-        _rt.add(tSec);
-        _rqw.add(qw);
-        _rqx.add(qi);
-        _rqy.add(qj);
-        _rqz.add(qk);
+        if (dataType == 1.0) {
+          _rt.add(tSec);
+          _rqw.add(double.tryParse(parts[3]) ?? 0.0);
+          _rqx.add(double.tryParse(parts[4]) ?? 0.0);
+          _rqy.add(double.tryParse(parts[5]) ?? 0.0);
+          _rqz.add(double.tryParse(parts[6]) ?? 0.0);
+        } else if (dataType == 0.0) {
+          _histAccT.add(tSec);
+          _histAccX.add(double.tryParse(parts[3]) ?? 0.0);
+          _histAccY.add(double.tryParse(parts[4]) ?? 0.0);
+          _histAccZ.add(double.tryParse(parts[5]) ?? 0.0);
+        }
       }
       if (_rt.length >= 2) {
-        _replayT = 0.0;
-        _replayTMax = _rt.last;
-        _replayPaddle = PaddleOrientation(
-          tSec: _rt,
-          qw: _rqw,
-          qx: _rqx,
-          qy: _rqy,
-          qz: _rqz,
-          fixedXDeg: 0.0,
-          fixedYDeg: 45.0,
-          fixedZDeg: 90.0,
-          yawOnly: true,
-        );
         // Build gyro-based stroke signal exactly as the test screen does.
         _buildReplayStrokeSignal();
+        // Compute final session metrics (stroke count, SPM, mean pull length).
+        _computeHistMetrics();
         if (mounted) setState(() {});
       }
     } catch (_) {
       // Ignore CSV parse errors here
     }
+  }
+
+  /// Computes all historical session metrics:
+  /// • Average acceleration, total strokes, mean SPM, mean pull length (final values)
+  /// • Per-sample SPM / stroke-count timelines for live-replay metric updates
+  /// • Accel timeline for the first paddler for fast replay lookups
+  void _computeHistMetrics() {
+    // Average acceleration + accel timeline from pre-loaded magnitude data.
+    if (_historicalData != null && _historicalData!.isNotEmpty) {
+      final allPts = _historicalData!.values.expand((pts) => pts).toList();
+      if (allPts.isNotEmpty) {
+        _histAvgAccel =
+            allPts.map((p) => p.accel).reduce((a, b) => a + b) / allPts.length;
+      }
+      // Build fast-lookup timeline for the first paddler's accel.
+      final firstKey = _historicalData!.keys.first;
+      final firstPts = _historicalData![firstKey]!;
+      _histAccelT = firstPts.map((p) => p.time).toList();
+      _histAccelV = firstPts.map((p) => p.accel).toList();
+    }
+
+    // Stroke count + SPM: replay the gyro stroke signal through a fresh detector,
+    // capturing the per-sample timeline for dynamic replay updates.
+    if (_replayStrokeT.isNotEmpty && _replayStrokeSig.isNotEmpty) {
+      final det = StrokeDetector(
+        windowSec: 5.0,
+        minPeakDistanceSec: 0.80,
+        smoothingAlpha: 0.1,
+        baselineAlpha: 0.05,
+        thresholdMin: 0.55,
+        thresholdK: 1.0,
+        warmupSec: 0.5,
+      );
+
+      final timelineSpm = <double>[];
+      final timelineCount = <int>[];
+      StrokeUpdate lastUpd = const StrokeUpdate(0.0, 0, 0);
+
+      for (var i = 0; i < _replayStrokeT.length; i++) {
+        lastUpd = det.addSample(
+          tSec: _replayStrokeT[i],
+          accelMag: _replayStrokeSig[i],
+        );
+        timelineSpm.add(lastUpd.rateSpm);
+        timelineCount.add(lastUpd.totalStrokes);
+      }
+
+      _histTimelineSpm = timelineSpm;
+      _histTimelineCount = timelineCount;
+
+      // Mean pull length via PLD — store per-stroke data for dynamic replay.
+      if (_histAccT.isNotEmpty && _rt.isNotEmpty) {
+        final rows = _pld.preprocess(
+          tAcc: _histAccT,
+          ax: _histAccX,
+          ay: _histAccY,
+          az: _histAccZ,
+          tRot: _rt,
+          qw: _rqw,
+          qx: _rqx,
+          qy: _rqy,
+          qz: _rqz,
+        );
+        if (rows.isNotEmpty) {
+          final result = _pld.process(
+            rows,
+            externalPeakTimes: det.allPeakTimes,
+          );
+          _histPeakTimes = List.from(result.peakTimes);
+          _histPullLengths = List.from(result.pullLengths);
+        }
+      }
+    }
+
+    // Seed dynamic display values. Accel starts at session average so the card
+    // is never blank; the others start at 0 and count up with the replay.
+    _dynAccel = _histAvgAccel;
+    _dynSpm = 0.0;
+    _dynStrokes = 0;
+    _dynPullLength = 0.0;
+  }
+
+  /// Called every 100 ms by the historical graph replay timer.
+  /// Updates all four metric cards to reflect the current replay position.
+  void _onHistReplayTick(double timeSec) {
+    if (!mounted) return;
+    setState(() {
+      // Stroke rate + count: binary search in the gyro-signal timeline.
+      if (_replayStrokeT.isNotEmpty) {
+        final idx = (_lowerBound(_replayStrokeT, timeSec) - 1)
+            .clamp(0, _replayStrokeT.length - 1);
+        _dynSpm = _histTimelineSpm.isNotEmpty ? _histTimelineSpm[idx] : 0.0;
+        _dynStrokes =
+            _histTimelineCount.isNotEmpty ? _histTimelineCount[idx] : 0;
+      }
+      // Current accel: binary search in the first paddler's accel timeline.
+      if (_histAccelT.isNotEmpty) {
+        final idx = (_lowerBound(_histAccelT, timeSec) - 1)
+            .clamp(0, _histAccelT.length - 1);
+        _dynAccel = _histAccelV[idx];
+      }
+      // Mean pull length: mean of all strokes whose peak is at or before now.
+      if (_histPeakTimes.isNotEmpty) {
+        final count = _lowerBound(_histPeakTimes, timeSec);
+        if (count > 0 && count <= _histPullLengths.length) {
+          double sum = 0;
+          for (var i = 0; i < count; i++) {
+            sum += _histPullLengths[i];
+          }
+          _dynPullLength = sum / count;
+        } else {
+          _dynPullLength = 0.0;
+        }
+      }
+    });
+  }
+
+  /// Binary lower-bound (leftmost insertion point) on a sorted list.
+  int _lowerBound(List<double> a, double x) {
+    int lo = 0, hi = a.length;
+    while (lo < hi) {
+      final mid = (lo + hi) >> 1;
+      if (a[mid] < x) {
+        lo = mid + 1;
+      } else {
+        hi = mid;
+      }
+    }
+    return lo;
   }
 
   /// Mirrors StrokeTestScreen._buildStrokeSignal() exactly:
@@ -1349,15 +1468,15 @@ class _SessionScreenState extends State<SessionScreen> {
     }
     if (n > 1) gyroMag[0] = gyroMag[1];
 
-    // Step 3: moving average window 11 (identical to test screen)
+    // Centred moving-average helper
     List<double> ma(List<double> v, int w) {
       if (w <= 1) return List<double>.from(v);
       final out = List<double>.filled(v.length, 0.0);
-      final half = w ~/ 2;
+      final h = w ~/ 2;
       for (var i = 0; i < v.length; i++) {
         double s = 0.0;
         int cnt = 0;
-        for (var j = -half; j <= half; j++) {
+        for (var j = -h; j <= h; j++) {
           final idx = i + j;
           if (idx >= 0 && idx < v.length) {
             s += v[idx];
@@ -1369,56 +1488,56 @@ class _SessionScreenState extends State<SessionScreen> {
       return out;
     }
 
-    final gSmooth = ma(gyroMag, 11);
+    // Step 3: MA(15) — water-stroke smooth window
+    final gSmooth = ma(gyroMag, 15);
 
-    // Step 4: global 5–95% percentile normalization (identical to test screen)
-    final sorted = List<double>.from(gSmooth)..sort();
-    double pickP(double p) {
-      if (sorted.isEmpty) return 0.0;
-      final idx = ((sorted.length - 1) * p).round().clamp(0, sorted.length - 1);
-      return sorted[idx];
+    // Step 4: rolling 3-second local min-max normalisation
+    final dts = List<double>.filled(n, 0.02);
+    for (var i = 1; i < n; i++) {
+      dts[i] = (_rt[i] - _rt[i - 1]).clamp(1e-3, 0.05);
+    }
+    final dtSorted = List<double>.from(dts.sublist(1))..sort();
+    final medianDt = dtSorted.isNotEmpty
+        ? dtSorted[dtSorted.length ~/ 2]
+        : 0.02;
+    final windowFrames = (3.0 / medianDt).round().clamp(10, n);
+    final wHalf = windowFrames ~/ 2;
+
+    final rollMin = List<double>.filled(n, 0.0);
+    final rollMax = List<double>.filled(n, 0.0);
+    for (var i = 0; i < n; i++) {
+      final from = (i - wHalf).clamp(0, n - 1);
+      final to = (i + wHalf).clamp(0, n - 1);
+      double mn = gSmooth[from], mx = gSmooth[from];
+      for (var j = from + 1; j <= to; j++) {
+        if (gSmooth[j] < mn) mn = gSmooth[j];
+        if (gSmooth[j] > mx) mx = gSmooth[j];
+      }
+      rollMin[i] = mn;
+      rollMax[i] = mx;
     }
 
-    final low = pickP(0.05);
-    final high = pickP(0.95);
-    final denom = (high > low) ? (high - low) : 1e-6;
+    final rawSig = List<double>.generate(n, (i) {
+      return ((gSmooth[i] - rollMin[i]) / (rollMax[i] - rollMin[i] + 1e-9))
+          .clamp(0.0, 1.0);
+    });
+
+    // Step 5: second MA(5) pass on the normalised signal
+    final sig = ma(rawSig, 5);
+
+    // Step 6: noise gate — zero where smoothed gyro < 2× 30th-percentile floor
+    final gSmoothSorted = List<double>.from(gSmooth)..sort();
+    final noiseFloor =
+        gSmoothSorted[((gSmoothSorted.length - 1) * 0.30).round().clamp(
+          0,
+          gSmoothSorted.length - 1,
+        )];
+    for (var i = 0; i < n; i++) {
+      if (gSmooth[i] < noiseFloor * 2.0) sig[i] = 0.0;
+    }
 
     _replayStrokeT = List.from(_rt);
-    _replayStrokeSig = List<double>.generate(n, (i) {
-      final v = (gSmooth[i] - low) / denom;
-      return v < 0 ? 0.0 : (v > 1.0 ? 1.0 : v);
-    });
+    _replayStrokeSig = sig;
   }
 
-  /// Binary lower-bound helper used for nearest-neighbour lookup on sorted time lists.
-  int _lowerBound(List<double> a, double x) {
-    int lo = 0, hi = a.length;
-    while (lo < hi) {
-      final mid = (lo + hi) >> 1;
-      if (a[mid] < x) {
-        lo = mid + 1;
-      } else {
-        hi = mid;
-      }
-    }
-    return lo;
-  }
-
-  void _ensureReplayTimer() {
-    if (_replayPaddle == null || _replayObj == null) return;
-    _replayTimer ??= Timer.periodic(const Duration(milliseconds: 33), (_) {
-      if (_replayPaddle == null || _replayObj == null) return;
-      // Advance time; simple looping playback
-      _replayT += 1.0 / 30.0;
-      if (_replayT > _replayTMax) _replayT = 0.0;
-      final e = _replayPaddle!.eulerAt(_replayT);
-      _replayObj!.rotation.setValues(e.x, e.y, e.z);
-      _replayObj!.updateTransform();
-      if (mounted) {
-        setState(() {
-          // Update replay stroke metrics UI to match the replay timeline.
-        });
-      }
-    });
-  }
 }

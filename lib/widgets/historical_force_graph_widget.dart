@@ -8,11 +8,15 @@ class HistoricalForceGraphWidget extends StatefulWidget {
   final Map<String, List<AccelDataPoint>> historicalData;
   final Function(List<Paddler>)? onReplayUpdate;
 
+  /// Called every replay tick with the current replay time in seconds.
+  final void Function(double timeSec)? onReplayTick;
+
   const HistoricalForceGraphWidget({
     super.key,
     required this.paddlers,
     required this.historicalData,
     this.onReplayUpdate,
+    this.onReplayTick,
   });
 
   @override
@@ -22,18 +26,21 @@ class HistoricalForceGraphWidget extends StatefulWidget {
 
 class _HistoricalForceGraphWidgetState
     extends State<HistoricalForceGraphWidget> {
+  /// Data revealed so far, one list per paddler.
   final List<List<AccelDataPoint>> _streamingData = [];
-  Timer? _timer;
-  double _currentTime = 0.0;
-  final double _updateInterval = 0.1; // Update every 0.1 seconds
-  final double _xAxisWindow = 20.0; // Show 20 seconds of data
-  final int _maxDataPoints = 200; // Keep last 200 data points
 
-  // Replay state
+  /// All session data, pre-loaded once.
   final List<List<AccelDataPoint>> _fullHistoricalData = [];
+
+  /// Per-paddler insertion cursor so each tick only appends new points (O(1)).
+  final List<int> _replayIndices = [];
+
+  Timer? _timer;
   double _replayTime = 0.0;
   double _maxReplayTime = 0.0;
   bool _isReplaying = false;
+
+  static const double _updateInterval = 0.1; // seconds per tick
 
   @override
   void initState() {
@@ -51,52 +58,31 @@ class _HistoricalForceGraphWidgetState
   }
 
   void _loadHistoricalData() {
+    _timer?.cancel();
     _streamingData.clear();
     _fullHistoricalData.clear();
-    _currentTime = 0.0;
+    _replayIndices.clear();
     _replayTime = 0.0;
     _maxReplayTime = 0.0;
+    _isReplaying = false;
 
-    // Load full historical data for replay
-    for (var paddler in widget.paddlers) {
-      final dataPoints = widget.historicalData[paddler.id] ?? [];
-      _fullHistoricalData.add(List.from(dataPoints));
-
-      // Find max time in all data
-      if (dataPoints.isNotEmpty) {
-        final maxTime = dataPoints
-            .map((p) => p.time)
-            .reduce((a, b) => a > b ? a : b);
-        if (maxTime > _maxReplayTime) {
-          _maxReplayTime = maxTime;
-        }
+    for (final paddler in widget.paddlers) {
+      final pts = widget.historicalData[paddler.id] ?? [];
+      _fullHistoricalData.add(List.from(pts));
+      _streamingData.add([]);
+      _replayIndices.add(0);
+      if (pts.isNotEmpty && pts.last.time > _maxReplayTime) {
+        _maxReplayTime = pts.last.time;
       }
     }
 
-    // Initialize streaming data with empty lists
-    for (int i = 0; i < widget.paddlers.length; i++) {
-      _streamingData.add([]);
-    }
-
-    // Start replay
     _startReplay();
   }
 
   void _startReplay() {
-    if (_isReplaying || _fullHistoricalData.isEmpty) {
-      return;
-    }
-
+    if (_isReplaying || _fullHistoricalData.isEmpty) return;
     _isReplaying = true;
-    _replayTime = 0.0;
-    _currentTime = 0.0;
 
-    // Clear streaming data to start fresh
-    for (int i = 0; i < _streamingData.length; i++) {
-      _streamingData[i].clear();
-    }
-
-    _timer?.cancel();
     _timer = Timer.periodic(
       Duration(milliseconds: (_updateInterval * 1000).toInt()),
       (timer) {
@@ -107,92 +93,56 @@ class _HistoricalForceGraphWidgetState
 
         setState(() {
           _replayTime += _updateInterval;
-          _currentTime = _replayTime;
 
-          // For each paddler, add all points that are at or before current replay time
+          // Append new points for each paddler using the insertion cursor.
           for (
             int i = 0;
             i < _fullHistoricalData.length && i < widget.paddlers.length;
             i++
           ) {
             final fullData = _fullHistoricalData[i];
-            if (fullData.isEmpty) continue;
-
             final currentData = _streamingData[i];
+            while (_replayIndices[i] < fullData.length &&
+                fullData[_replayIndices[i]].time <= _replayTime) {
+              currentData.add(fullData[_replayIndices[i]]);
+              _replayIndices[i]++;
+            }
+          }
+        });
 
-            // Add all points that are at or before replay time and not already added
-            for (var point in fullData) {
-              // Only add points up to current replay time
-              if (point.time <= _replayTime) {
-                // Check if we already have this point (within small tolerance)
-                final exists = currentData.any(
-                  (p) => (p.time - point.time).abs() < 0.001,
-                );
-                if (!exists) {
-                  currentData.add(point);
-                }
-              } else {
-                // Data is sorted, so we can break once we pass replay time
+        // Fire tick callback outside setState so the parent can call its own setState.
+        widget.onReplayTick?.call(_replayTime);
+
+        // Paddler-force callback (kept for backward compat).
+        if (widget.onReplayUpdate != null) {
+          final updated = <Paddler>[];
+          for (
+            int i = 0;
+            i < widget.paddlers.length && i < _fullHistoricalData.length;
+            i++
+          ) {
+            final fullData = _fullHistoricalData[i];
+            AccelDataPoint? cur;
+            for (final p in fullData.reversed) {
+              if (p.time <= _replayTime) {
+                cur = p;
                 break;
               }
             }
-
-            // Sort by time
-            currentData.sort((a, b) => a.time.compareTo(b.time));
-
-            // Keep only points within visible window (rolling window)
-            final minVisibleTime = (_currentTime - _xAxisWindow).clamp(
-              0.0,
-              double.infinity,
-            );
-            currentData.removeWhere((p) => p.time < minVisibleTime);
-
-            // Keep only last N points to prevent memory issues
-            if (currentData.length > _maxDataPoints) {
-              currentData.removeRange(0, currentData.length - _maxDataPoints);
-            }
+            updated.add(widget.paddlers[i].copyWith(
+              currentForce: cur?.accel ?? 0.0,
+              position: cur != null ? [0, 0] : widget.paddlers[i].position,
+            ));
           }
-
-          // Update paddler data based on current replay time
-          if (widget.onReplayUpdate != null) {
-            final updatedPaddlers = <Paddler>[];
-            for (
-              int i = 0;
-              i < widget.paddlers.length && i < _fullHistoricalData.length;
-              i++
-            ) {
-              final paddler = widget.paddlers[i];
-              final fullData = _fullHistoricalData[i];
-
-              // Find the most recent data point at or before current replay time
-              AccelDataPoint? currentPoint;
-              for (var point in fullData.reversed) {
-                if (point.time <= _replayTime) {
-                  currentPoint = point;
-                  break;
-                }
-              }
-
-              // Update paddler with current force value
-              final updatedPaddler = paddler.copyWith(
-                currentForce: currentPoint?.accel ?? 0.0,
-                position: currentPoint != null ? [0, 0] : paddler.position,
-              );
-              updatedPaddlers.add(updatedPaddler);
-            }
-
-            // Call callback with updated paddlers
-            if (updatedPaddlers.length == widget.paddlers.length) {
-              widget.onReplayUpdate!(updatedPaddlers);
-            }
+          if (updated.length == widget.paddlers.length) {
+            widget.onReplayUpdate!(updated);
           }
+        }
 
-          // Stop replay when we've reached the end
-          if (_replayTime >= _maxReplayTime) {
-            _isReplaying = false;
-            timer.cancel();
-          }
-        });
+        if (_replayTime >= _maxReplayTime) {
+          _isReplaying = false;
+          timer.cancel();
+        }
       },
     );
   }
@@ -205,21 +155,12 @@ class _HistoricalForceGraphWidgetState
 
   @override
   Widget build(BuildContext context) {
-    // Calculate window for replay
-    double minX, maxX;
-    if (_currentTime <= 0) {
-      // Initial state - show a window
-      minX = 0.0;
-      maxX = _xAxisWindow;
-    } else if (_currentTime <= _xAxisWindow) {
-      // Growing window phase
-      minX = 0.0;
-      maxX = _currentTime;
-    } else {
-      // Scrolling window phase
-      minX = _currentTime - _xAxisWindow;
-      maxX = _currentTime;
-    }
+    // Always show the full session timeline from 0 to session end.
+    final maxX = _maxReplayTime > 0 ? _maxReplayTime : 60.0;
+
+    // Adaptive bottom-axis interval: aim for ~6 labels.
+    final rawInterval = (maxX / 6).ceilToDouble();
+    final axisInterval = rawInterval < 1 ? 1.0 : rawInterval;
 
     return Container(
       height: 250,
@@ -231,7 +172,6 @@ class _HistoricalForceGraphWidgetState
           Wrap(
             spacing: 16,
             children: widget.paddlers.asMap().entries.map((entry) {
-              final index = entry.key;
               final paddler = entry.value;
               return Row(
                 mainAxisSize: MainAxisSize.min,
@@ -246,28 +186,24 @@ class _HistoricalForceGraphWidgetState
                   ),
                   const SizedBox(width: 4),
                   Text(
-                    'P${index + 1}',
-                    style: TextStyle(fontSize: 12, color: Colors.grey.shade700),
+                    'P${entry.key + 1}',
+                    style:
+                        TextStyle(fontSize: 12, color: Colors.grey.shade700),
                   ),
                 ],
               );
             }).toList(),
           ),
           const SizedBox(height: 8),
-          // Chart
           Expanded(
             child: LineChart(
-              key: ValueKey(
-                'historical_chart_${_replayTime.toStringAsFixed(1)}_${_streamingData.fold(0, (sum, list) => sum + list.length)}',
-              ),
               LineChartData(
                 gridData: FlGridData(
                   show: true,
                   drawVerticalLine: false,
                   horizontalInterval: 5,
-                  getDrawingHorizontalLine: (value) {
-                    return FlLine(color: Colors.grey.shade300, strokeWidth: 1);
-                  },
+                  getDrawingHorizontalLine: (value) =>
+                      FlLine(color: Colors.grey.shade300, strokeWidth: 1),
                 ),
                 titlesData: FlTitlesData(
                   show: true,
@@ -281,16 +217,14 @@ class _HistoricalForceGraphWidgetState
                     sideTitles: SideTitles(
                       showTitles: true,
                       reservedSize: 30,
-                      interval: 4,
-                      getTitlesWidget: (value, meta) {
-                        return Text(
-                          '${value.toInt()}s',
-                          style: TextStyle(
-                            color: Colors.grey.shade600,
-                            fontSize: 10,
-                          ),
-                        );
-                      },
+                      interval: axisInterval,
+                      getTitlesWidget: (value, meta) => Text(
+                        '${value.toInt()}s',
+                        style: TextStyle(
+                          color: Colors.grey.shade600,
+                          fontSize: 10,
+                        ),
+                      ),
                     ),
                   ),
                   leftTitles: AxisTitles(
@@ -298,15 +232,13 @@ class _HistoricalForceGraphWidgetState
                       showTitles: true,
                       reservedSize: 40,
                       interval: 5,
-                      getTitlesWidget: (value, meta) {
-                        return Text(
-                          '${value.toInt()}',
-                          style: TextStyle(
-                            color: Colors.grey.shade600,
-                            fontSize: 10,
-                          ),
-                        );
-                      },
+                      getTitlesWidget: (value, meta) => Text(
+                        '${value.toInt()}',
+                        style: TextStyle(
+                          color: Colors.grey.shade600,
+                          fontSize: 10,
+                        ),
+                      ),
                     ),
                   ),
                 ),
@@ -314,39 +246,27 @@ class _HistoricalForceGraphWidgetState
                   show: true,
                   border: Border.all(color: Colors.grey.shade300),
                 ),
-                minX: minX,
+                minX: 0,
                 maxX: maxX,
                 minY: 0,
-                maxY: 25, // m/s² acceleration magnitude
+                maxY: 25,
                 clipData: FlClipData.all(),
                 lineBarsData: widget.paddlers.asMap().entries.map((entry) {
                   final index = entry.key;
                   final paddler = entry.value;
-                  final dataPoints =
-                      _streamingData.isNotEmpty && index < _streamingData.length
-                      ? _streamingData[index]
-                      : <AccelDataPoint>[];
-
-                  // Filter data points to only show those within the visible range
-                  final visiblePoints = dataPoints
-                      .where(
-                        (point) => point.time >= minX && point.time <= maxX,
-                      )
-                      .toList();
-
+                  final pts =
+                      index < _streamingData.length ? _streamingData[index] : <AccelDataPoint>[];
                   return LineChartBarData(
-                    spots: visiblePoints.map((point) {
-                      return FlSpot(point.time, point.accel);
-                    }).toList(),
+                    spots: pts.map((p) => FlSpot(p.time, p.accel)).toList(),
                     isCurved: true,
                     curveSmoothness: 0.35,
                     color: paddler.color,
-                    barWidth: 3,
+                    barWidth: 2,
                     isStrokeCapRound: true,
                     dotData: const FlDotData(show: false),
                     belowBarData: BarAreaData(
                       show: true,
-                      color: paddler.color.withOpacity(0.1),
+                      color: paddler.color.withValues(alpha: 0.08),
                     ),
                   );
                 }).toList(),
