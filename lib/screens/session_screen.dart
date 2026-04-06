@@ -11,6 +11,8 @@ import '../services/csv_logger.dart';
 import '../services/session_storage.dart';
 import '../services/stroke_detector.dart';
 import '../services/pull_length_detector.dart';
+import '../services/paddle_orientation.dart';
+import 'package:flutter_cube/flutter_cube.dart';
 import 'dart:math' show sqrt, acos, pi, pow;
 import 'dart:io';
 import 'package:path_provider/path_provider.dart';
@@ -104,6 +106,9 @@ class _SessionScreenState extends State<SessionScreen> {
   final List<double> _qy = [];
   final List<double> _qz = [];
   static const int _maxQuatSamples = 512;
+  PaddleOrientation? _livePaddle;
+  Object? _paddleObj;
+  Timer? _renderTimer;
   StreamSubscription<SensorData>? _liveBleSub;
 
   // Replay quat buffers — used for gyro stroke signal and PLD preprocessing
@@ -112,6 +117,11 @@ class _SessionScreenState extends State<SessionScreen> {
   final List<double> _rqx = [];
   final List<double> _rqy = [];
   final List<double> _rqz = [];
+  PaddleOrientation? _replayPaddle;
+  Object? _replayObj;
+  Timer? _replayTimer;
+  double _replayT = 0.0;
+  double _replayTMax = 0.0;
 
   // Replay gyro-based stroke signal (mirrors test screen's _strokeT/_strokeSig)
   List<double> _replayStrokeT = [];
@@ -377,6 +387,8 @@ class _SessionScreenState extends State<SessionScreen> {
     // Don't save CSV on dispose - only save when user explicitly stops recording
     // _csvLogger.stopLogging(); // Removed to prevent duplicate saves
     _liveBleSub?.cancel();
+    _renderTimer?.cancel();
+    _replayTimer?.cancel();
     super.dispose();
   }
 
@@ -634,8 +646,8 @@ class _SessionScreenState extends State<SessionScreen> {
           // Replay-driven metric cards (update live as graph replays)
           _buildCompactMetricsWrap([
               _buildCompactMetricCard(
-                'Accel / Force',
-                _formatAccelForce(_dynAccel, _dynPseudoForce),
+                'Accel',
+                '${_dynAccel.toStringAsFixed(1)} m/s²',
                 Icons.speed,
               ),
               _buildCompactMetricCard(
@@ -656,6 +668,12 @@ class _SessionScreenState extends State<SessionScreen> {
                 Icons.straighten,
                 iconColor: Colors.purple.shade700,
               ),
+              _buildCompactMetricCard(
+                'Est. Force',
+                '${_dynPseudoForce.toStringAsFixed(1)} N',
+                Icons.bolt,
+                iconColor: Colors.orange.shade700,
+              ),
             ],
           ),
           const SizedBox(height: 16),
@@ -672,6 +690,25 @@ class _SessionScreenState extends State<SessionScreen> {
                 : const Center(child: Text('No historical data available')),
           ),
           const SizedBox(height: 16),
+          // 3D paddle replay (only when quaternion data was recorded)
+          if (_replayPaddle != null)
+            _buildSectionCard(
+              title: 'Paddle Orientation (Replay)',
+              child: SizedBox(
+                height: 220,
+                child: Cube(
+                  interactive: false,
+                  onSceneCreated: (scene) {
+                    scene.camera.zoom = 8;
+                    final obj = Object(fileName: 'assets/models/paddle.obj');
+                    _replayObj = obj;
+                    scene.world.add(obj);
+                    _ensureReplayTimer();
+                  },
+                ),
+              ),
+            ),
+          if (_replayPaddle != null) const SizedBox(height: 16),
         ],
       );
     }
@@ -732,6 +769,24 @@ class _SessionScreenState extends State<SessionScreen> {
                 key: _forceGraphKey,
                 paddlers: paddlers,
                 isRecording: isRecording,
+              ),
+            ),
+            const SizedBox(height: 16),
+            // 3D live paddle orientation
+            _buildSectionCard(
+              title: 'Paddle Orientation (Live)',
+              child: SizedBox(
+                height: 220,
+                child: Cube(
+                  interactive: false,
+                  onSceneCreated: (scene) {
+                    scene.camera.zoom = 8;
+                    final obj = Object(fileName: 'assets/models/paddle.obj');
+                    _paddleObj = obj;
+                    scene.world.add(obj);
+                    _ensureRenderTimer();
+                  },
+                ),
               ),
             ),
             const SizedBox(height: 16),
@@ -981,13 +1036,6 @@ class _SessionScreenState extends State<SessionScreen> {
     return previousForce + alpha * (targetForce - previousForce);
   }
 
-  String _formatAccelForce(double accelMagnitude, double pseudoForce) {
-    if (accelMagnitude <= 0) {
-      return '--';
-    }
-    return '${accelMagnitude.toStringAsFixed(1)} m/s^2\n${pseudoForce.toStringAsFixed(0)} N';
-  }
-
   Widget _buildSectionCard({required String title, required Widget child}) {
     return Container(
       padding: const EdgeInsets.all(16),
@@ -1225,7 +1273,43 @@ class _SessionScreenState extends State<SessionScreen> {
           _qy.removeRange(0, drop);
           _qz.removeRange(0, drop);
         }
+        // Rebuild live orientation for 3D paddle.
+        if (_qt.length >= 2) {
+          _livePaddle = PaddleOrientation(
+            tSec: List<double>.from(_qt),
+            qw: List<double>.from(_qw),
+            qx: List<double>.from(_qx),
+            qy: List<double>.from(_qy),
+            qz: List<double>.from(_qz),
+            fixedXDeg: 0.0,
+            fixedYDeg: 45.0,
+            fixedZDeg: 90.0,
+            yawOnly: true,
+          );
+        }
       }
+    });
+  }
+
+  void _ensureRenderTimer() {
+    _renderTimer ??= Timer.periodic(const Duration(milliseconds: 33), (_) {
+      if (_paddleObj == null || _livePaddle == null || _qt.isEmpty) return;
+      final t = _qt.last;
+      final e = _livePaddle!.eulerAt(t);
+      _paddleObj!.rotation.setValues(e.x, e.y, e.z);
+      _paddleObj!.updateTransform();
+    });
+  }
+
+  void _ensureReplayTimer() {
+    if (_replayPaddle == null || _replayObj == null) return;
+    _replayTimer ??= Timer.periodic(const Duration(milliseconds: 33), (_) {
+      if (_replayPaddle == null || _replayObj == null) return;
+      _replayT += 1.0 / 30.0;
+      if (_replayT > _replayTMax) _replayT = 0.0;
+      final e = _replayPaddle!.eulerAt(_replayT);
+      _replayObj!.rotation.setValues(e.x, e.y, e.z);
+      _replayObj!.updateTransform();
     });
   }
 
@@ -1312,6 +1396,19 @@ class _SessionScreenState extends State<SessionScreen> {
         }
       }
       if (_rt.length >= 2) {
+        _replayT = 0.0;
+        _replayTMax = _rt.last;
+        _replayPaddle = PaddleOrientation(
+          tSec: _rt,
+          qw: _rqw,
+          qx: _rqx,
+          qy: _rqy,
+          qz: _rqz,
+          fixedXDeg: 0.0,
+          fixedYDeg: 45.0,
+          fixedZDeg: 90.0,
+          yawOnly: true,
+        );
         // Build gyro-based stroke signal exactly as the test screen does.
         _buildReplayStrokeSignal();
         // Compute final session metrics (stroke count, SPM, mean pull length).
