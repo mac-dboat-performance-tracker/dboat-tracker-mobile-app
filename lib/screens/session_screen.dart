@@ -11,6 +11,7 @@ import '../services/csv_logger.dart';
 import '../services/session_storage.dart';
 import '../services/stroke_detector.dart';
 import '../services/pull_length_detector.dart';
+import 'video_generation_screen.dart';
 import '../services/paddle_orientation.dart';
 import 'package:flutter_cube/flutter_cube.dart';
 import 'dart:math' show sqrt, acos, pi, pow;
@@ -25,6 +26,7 @@ class SessionScreen extends StatefulWidget {
   @override
   State<SessionScreen> createState() => _SessionScreenState();
 }
+
 class _SessionScreenState extends State<SessionScreen> {
   final CSVLogger _csvLogger = CSVLogger();
   final GlobalKey<ForceGraphWidgetState> _forceGraphKey =
@@ -131,7 +133,7 @@ class _SessionScreenState extends State<SessionScreen> {
   double? _prevQw, _prevQx, _prevQy, _prevQz;
   double? _prevQt; // seconds
   final List<double> _gyroMag = [];
-  final int _gyroBufMax = 200;
+  final int _gyroBufMax = 600;
 
   @override
   void initState() {
@@ -643,39 +645,60 @@ class _SessionScreenState extends State<SessionScreen> {
         children: [
           _buildMetricsSectionForPastSession(duration, paddlers.length),
           const SizedBox(height: 16),
+          // 3D video generation
+          SizedBox(
+            width: double.infinity,
+            child: OutlinedButton.icon(
+              onPressed: () => Navigator.of(context).push(
+                MaterialPageRoute(
+                  builder: (_) => VideoGenerationScreen(
+                    sessionId: widget.session.id,
+                    sessionName: widget.session.name,
+                  ),
+                ),
+              ),
+              icon: const Icon(Icons.videocam_outlined),
+              label: const Text('Generate 3D Videos'),
+              style: OutlinedButton.styleFrom(
+                padding: const EdgeInsets.symmetric(vertical: 14),
+                side: BorderSide(color: Colors.blue.shade700),
+                foregroundColor: Colors.blue.shade700,
+              ),
+            ),
+          ),
+          const SizedBox(height: 16),
           // Replay-driven metric cards (update live as graph replays)
           _buildCompactMetricsWrap([
-              _buildCompactMetricCard(
-                'Accel',
-                '${_dynAccel.toStringAsFixed(1)} m/s²',
-                Icons.speed,
-              ),
-              _buildCompactMetricCard(
-                'Stroke Rate',
-                _dynSpm > 0 ? '${_dynSpm.toStringAsFixed(1)} spm' : '—',
-                Icons.fitness_center,
-              ),
-              _buildCompactMetricCard(
-                'Strokes',
-                '$_dynStrokes',
-                Icons.countertops,
-              ),
-              _buildCompactMetricCard(
-                'Pull Length',
-                _dynPullLength > 0
-                    ? '${_dynPullLength.toStringAsFixed(2)} m'
-                    : '—',
-                Icons.straighten,
-                iconColor: Colors.purple.shade700,
-              ),
-              _buildCompactMetricCard(
-                'Est. Force',
-                '${_dynPseudoForce.toStringAsFixed(1)} N',
-                Icons.bolt,
-                iconColor: Colors.orange.shade700,
-              ),
-            ],
-          ),
+            _buildCompactMetricCard(
+              'Accel',
+              '${_dynAccel.toStringAsFixed(1)} m/s²',
+              Icons.speed,
+            ),
+            _buildCompactMetricCard(
+              'Stroke Rate',
+              _dynSpm > 0 ? '${_dynSpm.toStringAsFixed(1)} spm' : '—',
+              Icons.fitness_center,
+            ),
+            _buildCompactMetricCard(
+              'Strokes',
+              '$_dynStrokes',
+              Icons.countertops,
+            ),
+            _buildCompactMetricCard(
+              'Pull Length',
+              _dynPullLength > 0
+                  ? '${_dynPullLength.toStringAsFixed(2)} m'
+                  : '—',
+              Icons.straighten,
+              iconColor: Colors.purple.shade700,
+            ),
+            _buildCompactMetricCard(
+              'Est. Force',
+              '${_dynPseudoForce.toStringAsFixed(1)} N',
+              Icons.bolt,
+              iconColor: Colors.orange.shade700,
+            ),
+          ]),
           const SizedBox(height: 16),
           // Acceleration graph — full session width, data fills left-to-right
           _buildSectionCard(
@@ -721,8 +744,9 @@ class _SessionScreenState extends State<SessionScreen> {
         final duration = _sessionStartTime != null
             ? DateTime.now().difference(_sessionStartTime!)
             : const Duration();
-        final currentAccel =
-            paddlers.isNotEmpty ? paddlers.first.currentForce : 0.0;
+        final currentAccel = paddlers.isNotEmpty
+            ? paddlers.first.currentForce
+            : 0.0;
 
         return ListView(
           padding: const EdgeInsets.all(16.0),
@@ -960,41 +984,38 @@ class _SessionScreenState extends State<SessionScreen> {
     Color? iconColor,
   }) {
     return Container(
-        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 10),
-        decoration: BoxDecoration(
-          color: Colors.white,
-          borderRadius: BorderRadius.circular(10),
-          boxShadow: [
-            BoxShadow(
-              color: Colors.black.withValues(alpha: 0.05),
-              blurRadius: 4,
-              offset: const Offset(0, 2),
-            ),
-          ],
-        ),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Icon(icon, size: 16, color: iconColor ?? Colors.blue.shade600),
-            const SizedBox(height: 4),
-            Text(
-              value,
-              style: const TextStyle(
-                fontSize: 13,
-                fontWeight: FontWeight.bold,
-              ),
-              maxLines: 2,
-              overflow: TextOverflow.ellipsis,
-            ),
-            const SizedBox(height: 2),
-            Text(
-              label,
-              style: TextStyle(fontSize: 9, color: Colors.grey.shade600),
-              overflow: TextOverflow.ellipsis,
-            ),
-          ],
-        ),
-      );
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 10),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(10),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withValues(alpha: 0.05),
+            blurRadius: 4,
+            offset: const Offset(0, 2),
+          ),
+        ],
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Icon(icon, size: 16, color: iconColor ?? Colors.blue.shade600),
+          const SizedBox(height: 4),
+          Text(
+            value,
+            style: const TextStyle(fontSize: 13, fontWeight: FontWeight.bold),
+            maxLines: 2,
+            overflow: TextOverflow.ellipsis,
+          ),
+          const SizedBox(height: 2),
+          Text(
+            label,
+            style: TextStyle(fontSize: 9, color: Colors.grey.shade600),
+            overflow: TextOverflow.ellipsis,
+          ),
+        ],
+      ),
+    );
   }
 
   double _estimatePaddlingForce({
@@ -1134,9 +1155,13 @@ class _SessionScreenState extends State<SessionScreen> {
             }
             final gSmooth = s / (cnt > 0 ? cnt : 1);
 
-            // Rolling 3-second local min-max over the buffer window.
-            // At ~20 Hz quaternion rate, 3 s ≈ 60 samples.
-            const roll = 60;
+            // Rolling 3-second local min-max — window size derived from the
+            // actual inter-arrival gap of the quaternion stream so it adapts
+            // to the true sample rate (e.g. ~150 Hz → roll ≈ 450 frames).
+            final dtLast = _qt.length >= 2
+                ? (_qt.last - _qt[_qt.length - 2]).abs().clamp(1e-6, 1.0)
+                : 0.02;
+            final roll = (3.0 / dtLast).round().clamp(10, _gyroMag.length);
             final from = _gyroMag.length > roll ? _gyroMag.length - roll : 0;
             double mn = _gyroMag[from], mx = _gyroMag[from];
             for (int i = from + 1; i < _gyroMag.length; i++) {
@@ -1191,7 +1216,7 @@ class _SessionScreenState extends State<SessionScreen> {
             _prevQx != null &&
             _prevQy != null &&
             _prevQz != null) {
-          final dt = (tSec - _prevQt!).clamp(1e-3, 0.05);
+          final dt = (tSec - _prevQt!).clamp(1e-6, 1.0);
           double w1 = _prevQw!, x1 = _prevQx!, y1 = _prevQy!, z1 = _prevQz!;
           double w2 = evt.qw, x2 = evt.qi, y2 = evt.qj, z2 = evt.qk;
           final n1 = sqrt(w1 * w1 + x1 * x1 + y1 * y1 + z1 * z1);
@@ -1328,9 +1353,7 @@ class _SessionScreenState extends State<SessionScreen> {
       qz: List<double>.from(_pldQz),
     );
     if (rows.isEmpty) return;
-    final peaks = _strokeDetector.allPeakTimes
-        .where((t) => t <= tSec)
-        .toList();
+    final peaks = _strokeDetector.allPeakTimes.where((t) => t <= tSec).toList();
     final result = _pld.process(rows, externalPeakTimes: peaks);
     _liveMeanPullLength = result.meanPullLength;
     _pldAccProcessedCount = _pldAccT.length;
@@ -1508,16 +1531,21 @@ class _SessionScreenState extends State<SessionScreen> {
     setState(() {
       // Stroke rate + count: binary search in the gyro-signal timeline.
       if (_replayStrokeT.isNotEmpty) {
-        final idx = (_lowerBound(_replayStrokeT, timeSec) - 1)
-            .clamp(0, _replayStrokeT.length - 1);
+        final idx = (_lowerBound(_replayStrokeT, timeSec) - 1).clamp(
+          0,
+          _replayStrokeT.length - 1,
+        );
         _dynSpm = _histTimelineSpm.isNotEmpty ? _histTimelineSpm[idx] : 0.0;
-        _dynStrokes =
-            _histTimelineCount.isNotEmpty ? _histTimelineCount[idx] : 0;
+        _dynStrokes = _histTimelineCount.isNotEmpty
+            ? _histTimelineCount[idx]
+            : 0;
       }
       // Current accel: binary search in the first paddler's accel timeline.
       if (_histAccelT.isNotEmpty) {
-        final idx = (_lowerBound(_histAccelT, timeSec) - 1)
-            .clamp(0, _histAccelT.length - 1);
+        final idx = (_lowerBound(_histAccelT, timeSec) - 1).clamp(
+          0,
+          _histAccelT.length - 1,
+        );
         _dynAccel = _histAccelV[idx];
       }
       // Mean pull length: mean of all strokes whose peak is at or before now.
@@ -1712,5 +1740,4 @@ class _SessionScreenState extends State<SessionScreen> {
     _replayStrokeT = List.from(_rt);
     _replayStrokeSig = sig;
   }
-
 }
